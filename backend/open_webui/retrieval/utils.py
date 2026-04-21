@@ -54,6 +54,23 @@ from open_webui.config import (
 log = logging.getLogger(__name__)
 
 
+def _get_auto_full_context_max_chars() -> int:
+    try:
+        return max(0, int(os.getenv("AUTO_FULL_CONTEXT_MAX_CHARS", "20000")))
+    except (TypeError, ValueError):
+        return 20000
+
+
+AUTO_FULL_CONTEXT_MAX_CHARS = _get_auto_full_context_max_chars()
+
+
+def _should_auto_use_full_context(content: Optional[str]) -> bool:
+    if AUTO_FULL_CONTEXT_MAX_CHARS <= 0:
+        return False
+
+    return bool(content) and len(content) <= AUTO_FULL_CONTEXT_MAX_CHARS
+
+
 from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
@@ -1093,34 +1110,49 @@ async def get_sources_from_items(
                     "metadatas": [[{"url": item.get("url"), "name": item.get("url")}]],
                 }
         elif item.get("type") == "file":
-            if (
+            item_file = item.get("file", {}) or {}
+            item_file_data = item_file.get("data", {}) or {}
+            item_file_metadata = item_file_data.get("metadata", {}) or {}
+            item_file_content = item_file_data.get("content", "")
+            file_object = None
+
+            use_full_context = (
                 item.get("context") == "full"
                 or request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
-            ):
-                if item.get("file", {}).get("data", {}).get("content", ""):
-                    # Manual Full Mode Toggle
-                    # Used from chat file modal, we can assume that the file content will be available from item.get("file").get("data", {}).get("content")
+                or item_file_data.get("context_mode") == "full"
+                or _should_auto_use_full_context(item_file_content)
+            )
+
+            if not use_full_context and item.get("id"):
+                file_object = Files.get_file_by_id(item.get("id"))
+                if file_object:
+                    file_data = file_object.data or {}
+                    use_full_context = (
+                        file_data.get("context_mode") == "full"
+                        or _should_auto_use_full_context(file_data.get("content", ""))
+                    )
+
+            if use_full_context:
+                if item_file_content:
+                    # Manual full mode or automatic small-file mode.
                     query_result = {
-                        "documents": [
-                            [item.get("file", {}).get("data", {}).get("content", "")]
-                        ],
+                        "documents": [[item_file_content]],
                         "metadatas": [
                             [
                                 {
                                     "file_id": item.get("id"),
                                     "name": item.get("name"),
-                                    **item.get("file")
-                                    .get("data", {})
-                                    .get("metadata", {}),
+                                    **item_file_metadata,
                                 }
                             ]
                         ],
                     }
                 elif item.get("id"):
-                    file_object = Files.get_file_by_id(item.get("id"))
+                    if file_object is None:
+                        file_object = Files.get_file_by_id(item.get("id"))
                     if file_object:
                         query_result = {
-                            "documents": [[file_object.data.get("content", "")]],
+                            "documents": [[(file_object.data or {}).get("content", "")]],
                             "metadatas": [
                                 [
                                     {

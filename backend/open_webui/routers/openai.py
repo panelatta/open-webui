@@ -1,7 +1,9 @@
 import asyncio
+import copy
 import hashlib
 import json
 import logging
+import time
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -26,6 +28,7 @@ from open_webui.internal.db import get_session
 
 from open_webui.models.models import Models
 from open_webui.models.access_grants import AccessGrants
+from open_webui.models.files import Files
 from open_webui.models.groups import Groups
 from open_webui.config import (
     CACHE_DIR,
@@ -58,6 +61,7 @@ from open_webui.utils.misc import (
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.anthropic import is_anthropic_url, get_anthropic_models
+from open_webui.storage.provider import Storage
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +121,120 @@ def openai_reasoning_model_handler(payload):
             payload["messages"][0]["role"] = "developer"
 
     return payload
+
+
+def merge_response_tools(
+    existing_tools: Optional[list], configured_tools: Optional[list]
+) -> Optional[list]:
+    if not configured_tools:
+        return existing_tools
+    if not existing_tools:
+        return configured_tools
+
+    merged_tools = []
+    seen = set()
+
+    for tool in [*existing_tools, *configured_tools]:
+        try:
+            marker = json.dumps(tool, sort_keys=True, ensure_ascii=False)
+        except TypeError:
+            marker = str(tool)
+
+        if marker in seen:
+            continue
+
+        seen.add(marker)
+        merged_tools.append(tool)
+
+    return merged_tools
+
+
+def apply_model_params_to_body_responses(params: dict, form_data: dict) -> dict:
+    if not params:
+        return form_data
+
+    payload = apply_model_params_to_body_openai(params.copy(), {})
+    configured_tools = payload.pop("tools", None)
+    configured_tool_choice = payload.pop("tool_choice", None)
+
+    if "max_tokens" in payload:
+        form_data["max_output_tokens"] = payload.pop("max_tokens")
+
+    if "reasoning_effort" in payload:
+        reasoning = form_data.get("reasoning") or {}
+        if not isinstance(reasoning, dict):
+            reasoning = {}
+        reasoning["effort"] = payload.pop("reasoning_effort")
+        form_data["reasoning"] = reasoning
+
+    form_data.update(payload)
+
+    if configured_tools is not None:
+        form_data["tools"] = merge_response_tools(
+            form_data.get("tools"), configured_tools
+        )
+
+    if configured_tool_choice is not None and "tool_choice" not in form_data:
+        form_data["tool_choice"] = configured_tool_choice
+
+    return form_data
+
+
+def apply_default_responses_reasoning_summary(
+    model: str | None, form_data: dict
+) -> dict:
+    if not model or not model.lower().startswith("gpt-5"):
+        return form_data
+
+    reasoning = form_data.get("reasoning")
+    if reasoning is None:
+        reasoning = {}
+    elif not isinstance(reasoning, dict):
+        reasoning = {}
+    else:
+        reasoning = reasoning.copy()
+
+    # Cherry Studio's GPT-5 requests effectively resolve to a detailed
+    # reasoning summary when summary streaming is available. Mirror that
+    # behavior here so Open WebUI has the best chance of receiving
+    # reasoning summary deltas instead of only a completed placeholder.
+    if reasoning.get("summary") in (None, "auto"):
+        reasoning["summary"] = "detailed"
+
+    form_data["reasoning"] = reasoning
+    return form_data
+
+
+def summarize_response_debug_value(value):
+    if isinstance(value, str):
+        return {"type": "str", "len": len(value)}
+    if isinstance(value, list):
+        return {"type": "list", "len": len(value)}
+    if isinstance(value, dict):
+        return {
+            key: summarize_response_debug_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def stream_sse_lines(stream: aiohttp.StreamReader):
+    async def yield_sse_lines():
+        buffer = b""
+
+        async for data, _ in stream.iter_chunks():
+            if not data:
+                continue
+
+            buffer += data
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                yield line + b"\n"
+
+        if buffer:
+            yield buffer
+
+    return yield_sse_lines()
 
 
 async def get_headers_and_cookies(
@@ -197,6 +315,353 @@ def get_microsoft_entra_id_access_token():
     except Exception as e:
         log.error(f"Error getting Microsoft Entra ID access token: {e}")
         return None
+
+
+def get_openai_api_config_for_index(request: Request, idx: int):
+    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+    key = request.app.state.config.OPENAI_API_KEYS[idx]
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
+        str(idx),
+        request.app.state.config.OPENAI_API_CONFIGS.get(url, {}),
+    )
+    return url, key, api_config
+
+
+def build_openai_file_upload_headers(
+    request: Request,
+    url: str,
+    key: Optional[str],
+    config: Optional[dict] = None,
+    metadata: Optional[dict] = None,
+    user: Optional[UserModel] = None,
+):
+    config = config or {}
+    headers = {
+        **(
+            {
+                "HTTP-Referer": "https://openwebui.com/",
+                "X-Title": "Open WebUI",
+            }
+            if "openrouter.ai" in url
+            else {}
+        ),
+    }
+
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
+        if metadata and metadata.get("chat_id"):
+            headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get("chat_id")
+
+    token = None
+    auth_type = config.get("auth_type")
+
+    if auth_type == "bearer" or auth_type is None:
+        token = key
+    elif auth_type == "none":
+        token = None
+    elif auth_type in ("azure_ad", "microsoft_entra_id"):
+        token = get_microsoft_entra_id_access_token()
+
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    if config.get("headers") and isinstance(config.get("headers"), dict):
+        headers = {**headers, **config.get("headers")}
+
+    headers.pop("Content-Type", None)
+    return headers
+
+
+def _extract_attachment_file_id(file_item: Optional[dict]) -> Optional[str]:
+    if not isinstance(file_item, dict):
+        return None
+
+    nested = file_item.get("file")
+    if isinstance(nested, dict) and nested.get("id"):
+        return nested.get("id")
+
+    file_id = file_item.get("id")
+    if isinstance(file_id, str) and file_id:
+        return file_id
+
+    return None
+
+
+def _extract_attachment_content_type(file_item: Optional[dict]) -> str:
+    if not isinstance(file_item, dict):
+        return ""
+
+    content_type = file_item.get("content_type")
+    if isinstance(content_type, str):
+        return content_type
+
+    nested = file_item.get("file")
+    if isinstance(nested, dict):
+        nested_meta = nested.get("meta") or {}
+        nested_content_type = nested_meta.get("content_type")
+        if isinstance(nested_content_type, str):
+            return nested_content_type
+
+    return ""
+
+
+def _is_image_attachment(file_item: Optional[dict]) -> bool:
+    if not isinstance(file_item, dict):
+        return False
+
+    attachment_type = file_item.get("type")
+    if attachment_type == "image":
+        return True
+
+    return _extract_attachment_content_type(file_item).startswith("image/")
+
+
+def invalidate_cached_openai_file_ids(attached_files: list[dict]) -> None:
+    for attached_file in attached_files:
+        local_file_id = _extract_attachment_file_id(attached_file)
+        if not local_file_id:
+            continue
+
+        Files.update_file_data_by_id(
+            local_file_id,
+            {
+                "openai_file_id": None,
+                "openai_backend_index": None,
+                "openai_api_base_url": None,
+                "openai_upload_status": "stale",
+                "openai_file_id_valid_for_next_request": False,
+                "error": None,
+            },
+        )
+
+
+def mark_openai_file_id_consumed(local_file_id: str) -> None:
+    Files.update_file_data_by_id(
+        local_file_id,
+        {
+            "openai_file_id_valid_for_next_request": False,
+            "openai_upload_status": "consumed",
+            "error": None,
+        },
+    )
+
+
+def is_unknown_file_id_error(response_payload) -> bool:
+    error_text = ""
+
+    if isinstance(response_payload, dict):
+        error = response_payload.get("error", response_payload)
+        if isinstance(error, dict):
+            error_text = (
+                error.get("message")
+                or error.get("detail")
+                or json.dumps(error, ensure_ascii=False, default=str)
+            )
+        else:
+            error_text = str(error)
+    else:
+        error_text = str(response_payload)
+
+    return "unknown file_id" in error_text.lower()
+
+
+def upload_local_file_to_openai(
+    request: Request,
+    file_item,
+    *,
+    idx: int = 0,
+    metadata: Optional[dict] = None,
+    user: Optional[UserModel] = None,
+) -> str:
+    url, key, api_config = get_openai_api_config_for_index(request, idx)
+    data = file_item.data or {}
+
+    if (
+        data.get("openai_file_id")
+        and data.get("openai_file_id_valid_for_next_request") is True
+        and data.get("openai_backend_index") == idx
+        and data.get("openai_api_base_url") == url
+    ):
+        return data["openai_file_id"]
+
+    if api_config.get("azure", False):
+        raise ValueError("Azure OpenAI file uploads are not supported by this override")
+
+    if not file_item.path:
+        raise ValueError("Local file path is missing")
+
+    file_path = Storage.get_file(file_item.path)
+    headers = build_openai_file_upload_headers(
+        request,
+        url,
+        key,
+        api_config,
+        metadata=metadata,
+        user=user,
+    )
+
+    content_type = ((file_item.meta or {}).get("content_type") or "").strip()
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    with open(file_path, "rb") as fh:
+        response = requests.post(
+            f"{url}/files",
+            data={"purpose": "user_data"},
+            files={"file": (file_item.filename, fh, content_type)},
+            headers=headers,
+            timeout=AIOHTTP_CLIENT_TIMEOUT,
+        )
+
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = response.text
+
+    if response.status_code >= 400:
+        if isinstance(response_payload, dict):
+            error = response_payload.get("error", response_payload)
+        else:
+            error = response_payload
+        raise ValueError(f"Upstream file upload failed: {error}")
+
+    if not isinstance(response_payload, dict) or not response_payload.get("id"):
+        raise ValueError("Upstream file upload returned no file id")
+
+    openai_file_id = response_payload["id"]
+    Files.update_file_data_by_id(
+        file_item.id,
+        {
+            "openai_file_id": openai_file_id,
+            "openai_backend_index": idx,
+            "openai_api_base_url": url,
+            "openai_upload_status": "uploaded",
+            "openai_file_id_valid_for_next_request": True,
+            "openai_uploaded_at": int(time.time()),
+            "status": "completed",
+            "error": None,
+        },
+    )
+    return openai_file_id
+
+
+def ensure_openai_file_id(
+    request: Request,
+    file_id: str,
+    *,
+    idx: int = 0,
+    metadata: Optional[dict] = None,
+    user: Optional[UserModel] = None,
+) -> Optional[str]:
+    file_item = Files.get_file_by_id(file_id)
+    if not file_item:
+        return None
+
+    return upload_local_file_to_openai(
+        request,
+        file_item,
+        idx=idx,
+        metadata=metadata,
+        user=user,
+    )
+
+
+async def inject_openai_files_into_messages(
+    request: Request,
+    payload: dict,
+    metadata: Optional[dict],
+    user: UserModel,
+    *,
+    idx: int,
+) -> dict:
+    attached_files = (metadata or {}).get("files") or payload.pop("files", None) or []
+    if not attached_files:
+        return payload
+
+    messages = payload.get("messages") or []
+    if not messages:
+        return payload
+
+    file_parts = []
+
+    for attached_file in attached_files:
+        if _is_image_attachment(attached_file):
+            continue
+
+        local_file_id = _extract_attachment_file_id(attached_file)
+        if not local_file_id:
+            continue
+
+        try:
+            openai_file_id = await asyncio.to_thread(
+                ensure_openai_file_id,
+                request,
+                local_file_id,
+                idx=idx,
+                metadata=metadata,
+                user=user,
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.DEFAULT(str(e)),
+            )
+
+        if openai_file_id:
+            file_parts.append({"type": "input_file", "file_id": openai_file_id})
+            # Treat upstream file ids as single-use for request routing.
+            # This avoids a stale cached file id adding a failed /responses
+            # attempt before we re-upload on the next turn.
+            await asyncio.to_thread(mark_openai_file_id_consumed, local_file_id)
+
+    if not file_parts:
+        return payload
+
+    last_user_message = None
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            last_user_message = message
+            break
+
+    if last_user_message is None:
+        messages.append({"role": "user", "content": file_parts})
+        payload["messages"] = messages
+        return payload
+
+    content = last_user_message.get("content", "")
+    if isinstance(content, str):
+        content_parts = [{"type": "text", "text": content}] if content else []
+    elif isinstance(content, list):
+        content_parts = list(content)
+    else:
+        content_parts = [{"type": "text", "text": str(content)}]
+
+    existing_file_ids = {
+        part.get("file_id")
+        or ((part.get("file") or {}).get("file_id") if isinstance(part, dict) else None)
+        for part in content_parts
+        if isinstance(part, dict)
+        and part.get("type") in {"file", "input_file"}
+    }
+    existing_file_ids.discard(None)
+
+    new_file_parts = [
+        part for part in file_parts if part.get("file_id") not in existing_file_ids
+    ]
+    last_user_message["content"] = [*new_file_parts, *content_parts]
+    payload["messages"] = messages
+    return payload
+
+
+def disable_local_file_context_capability(model: dict) -> dict:
+    info = model.get("info") or {}
+    meta = info.get("meta") or {}
+    capabilities = meta.get("capabilities") or {}
+    capabilities["file_context"] = False
+    meta["capabilities"] = capabilities
+    info["meta"] = meta
+    model["info"] = info
+    return model
 
 
 ##########################################
@@ -535,14 +1000,18 @@ async def get_all_models(request: Request, user: UserModel) -> dict[str, list]:
                         continue
 
                     if model_id and model_id not in models:
-                        models[model_id] = {
-                            **model,
-                            "name": model.get("name", model_id),
-                            "owned_by": "openai",
-                            "openai": model,
-                            "connection_type": model.get("connection_type", "external"),
-                            "urlIdx": idx,
-                        }
+                        models[model_id] = disable_local_file_context_capability(
+                            {
+                                **model,
+                                "name": model.get("name", model_id),
+                                "owned_by": "openai",
+                                "openai": model,
+                                "connection_type": model.get(
+                                    "connection_type", "external"
+                                ),
+                                "urlIdx": idx,
+                            }
+                        )
 
         return models
 
@@ -863,11 +1332,12 @@ def convert_to_responses_payload(payload: dict) -> dict:
         elif isinstance(content, list):
             content_parts = []
             for part in content:
-                if part.get("type") == "text":
+                part_type = part.get("type")
+                if part_type == "text":
                     content_parts.append(
                         {"type": text_type, "text": part.get("text", "")}
                     )
-                elif part.get("type") == "image_url":
+                elif part_type == "image_url":
                     url_data = part.get("image_url", {})
                     url = (
                         url_data.get("url", "")
@@ -875,6 +1345,18 @@ def convert_to_responses_payload(payload: dict) -> dict:
                         else url_data
                     )
                     content_parts.append({"type": "input_image", "image_url": url})
+                elif part_type in {"input_text", "output_text", "input_image"}:
+                    content_parts.append(part)
+                elif part_type in {"file", "input_file"}:
+                    file_data = part.get("file", {}) if isinstance(part, dict) else {}
+                    file_id = part.get("file_id") or file_data.get("file_id")
+                    file_url = part.get("file_url") or file_data.get("file_url")
+                    if file_id:
+                        content_parts.append({"type": "input_file", "file_id": file_id})
+                    elif file_url:
+                        content_parts.append(
+                            {"type": "input_file", "file_url": file_url}
+                        )
         else:
             content_parts = [{"type": text_type, "text": str(content)}]
 
@@ -885,11 +1367,54 @@ def convert_to_responses_payload(payload: dict) -> dict:
     if system_content:
         responses_payload["instructions"] = system_content
 
+    incoming_params = responses_payload.pop("params", None)
+    if isinstance(incoming_params, dict) and incoming_params:
+        params = incoming_params.copy()
+        system = params.pop("system", None)
+        if system and not responses_payload.get("instructions"):
+            responses_payload["instructions"] = system
+        if params:
+            responses_payload = apply_model_params_to_body_responses(
+                params, responses_payload
+            )
+
     if "max_tokens" in responses_payload:
         responses_payload["max_output_tokens"] = responses_payload.pop("max_tokens")
+    if "max_completion_tokens" in responses_payload:
+        responses_payload["max_output_tokens"] = responses_payload.pop(
+            "max_completion_tokens"
+        )
+    if "reasoning_effort" in responses_payload:
+        reasoning = responses_payload.get("reasoning") or {}
+        if not isinstance(reasoning, dict):
+            reasoning = {}
+        reasoning["effort"] = responses_payload.pop("reasoning_effort")
+        responses_payload["reasoning"] = reasoning
+
+    responses_payload = apply_default_responses_reasoning_summary(
+        responses_payload.get("model"),
+        responses_payload,
+    )
 
     # Remove Chat Completions-only parameters not supported by the Responses API
     for unsupported_key in (
+        "params",
+        "files",
+        "model_item",
+        "parent_message",
+        "background_tasks",
+        "features",
+        "variables",
+        "session_id",
+        "chat_id",
+        "id",
+        "parent_id",
+        "filter_ids",
+        "tool_ids",
+        "skill_ids",
+        "terminal_id",
+        "tool_servers",
+        "user",
         "stream_options",
         "logit_bias",
         "frequency_penalty",
@@ -924,13 +1449,171 @@ def convert_to_responses_payload(payload: dict) -> dict:
     return responses_payload
 
 
+def extract_text_from_response_parts(parts: Optional[list], separator: str = "") -> str:
+    texts = []
+    for part in parts or []:
+        if not isinstance(part, dict):
+            continue
+
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            texts.append(text)
+
+    return separator.join(texts).strip()
+
+
+def extract_chat_compatible_text_from_responses(response: dict) -> tuple[str, str]:
+    output = response.get("output")
+    if not isinstance(output, list):
+        output = []
+
+    assistant_messages = []
+    reasoning_messages = []
+
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "message" and item.get("role") == "assistant":
+            content = extract_text_from_response_parts(item.get("content"))
+            if content:
+                assistant_messages.append(content)
+        elif item_type == "reasoning":
+            summary = extract_text_from_response_parts(
+                item.get("summary"), separator="\n\n"
+            )
+            content = extract_text_from_response_parts(
+                item.get("content"), separator="\n\n"
+            )
+            reasoning_text = summary or content
+            if reasoning_text:
+                reasoning_messages.append(reasoning_text)
+
+    assistant_content = assistant_messages[-1].strip() if assistant_messages else ""
+    reasoning_content = reasoning_messages[-1].strip() if reasoning_messages else ""
+
+    if not assistant_content:
+        assistant_content = response.get("output_text", "") or ""
+
+    return assistant_content, reasoning_content
+
+
 def convert_responses_result(response: dict) -> dict:
     """
-    Convert non-streaming Responses API result.
-    Just add done flag - pass through raw response, frontend handles output.
+    Convert non-streaming Responses API result into Chat Completions-compatible
+    shape for existing Open WebUI task and non-stream consumers.
     """
+    assistant_content, reasoning_content = extract_chat_compatible_text_from_responses(
+        response
+    )
+
+    response["choices"] = [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": assistant_content,
+                **(
+                    {"reasoning_content": reasoning_content}
+                    if reasoning_content
+                    else {}
+                ),
+            },
+            "finish_reason": "stop",
+        }
+    ]
     response["done"] = True
     return response
+
+
+def build_openai_chat_task_metadata(form_data: dict, user: UserModel) -> dict:
+    metadata = form_data.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    return {
+        **metadata,
+        "user_id": user.id,
+        "chat_id": metadata.get("chat_id") or form_data.get("chat_id"),
+        "message_id": metadata.get("message_id") or form_data.get("id"),
+        "parent_message": metadata.get("parent_message")
+        or form_data.get("parent_message"),
+        "parent_message_id": metadata.get("parent_message_id")
+        or form_data.get("parent_id"),
+        "session_id": metadata.get("session_id") or form_data.get("session_id"),
+        "filter_ids": metadata.get("filter_ids", form_data.get("filter_ids", [])),
+        "tool_ids": metadata.get("tool_ids", form_data.get("tool_ids")),
+        "tool_servers": metadata.get("tool_servers", form_data.get("tool_servers")),
+        "files": metadata.get("files", form_data.get("files")),
+        "features": metadata.get("features", form_data.get("features", {})),
+        "variables": metadata.get("variables", form_data.get("variables", {})),
+        "model": metadata.get("model") or form_data.get("model"),
+        "params": metadata.get("params", {}),
+        "direct": metadata.get("direct", False),
+    }
+
+
+def summarize_error_message(error) -> str:
+    if isinstance(error, dict):
+        if isinstance(error.get("detail"), str):
+            return error["detail"]
+        nested_error = error.get("error")
+        if isinstance(nested_error, dict):
+            if isinstance(nested_error.get("message"), str):
+                return nested_error["message"]
+            if isinstance(nested_error.get("detail"), str):
+                return nested_error["detail"]
+        if isinstance(error.get("message"), str):
+            return error["message"]
+        return json.dumps(error, ensure_ascii=False, default=str)
+
+    return str(error)
+
+
+async def emit_openai_chat_compat_error(metadata: dict, error) -> None:
+    chat_id = metadata.get("chat_id")
+    message_id = metadata.get("message_id")
+    if not chat_id or not message_id:
+        return
+
+    error_message = summarize_error_message(error)
+
+    try:
+        from open_webui.models.chats import Chats
+        from open_webui.socket.main import get_event_emitter
+
+        if not chat_id.startswith("local:"):
+            Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id,
+                message_id,
+                {
+                    "error": {"content": error_message},
+                },
+            )
+
+        event_emitter = get_event_emitter(metadata)
+        if event_emitter:
+            await event_emitter(
+                {
+                    "type": "chat:message:error",
+                    "data": {"error": {"content": error_message}},
+                }
+            )
+            await event_emitter({"type": "chat:tasks:cancel"})
+    except Exception as e:
+        log.debug(f"Failed to emit /responses compatibility error: {e}")
+
+
+async def process_openai_responses_chat_compatibility(
+    request: Request,
+    form_data: dict,
+    user: UserModel,
+):
+    from open_webui.main import chat_completion as main_chat_completion
+
+    payload = dict(form_data or {})
+    return await main_chat_completion(request, payload, user)
 
 
 @router.post("/chat/completions")
@@ -952,6 +1635,15 @@ async def generate_chat_completion(
 
     payload = {**form_data}
     metadata = payload.pop("metadata", None)
+
+    incoming_params = payload.pop("params", None)
+    if isinstance(incoming_params, dict) and incoming_params:
+        params = incoming_params.copy()
+        system = params.pop("system", None)
+        if params:
+            payload = apply_model_params_to_body_openai(params, payload)
+        if system and not bypass_system_prompt:
+            payload = apply_system_prompt_to_body(system, payload, metadata, user)
 
     model_id = form_data.get("model")
     model_info = Models.get_model_by_id(model_id)
@@ -1065,10 +1757,25 @@ async def generate_chat_completion(
     )
 
     is_responses = api_config.get("api_type") == "responses"
+    attached_files = []
+    payload_before_openai_file_injection = None
+    if is_responses:
+        attached_files = (
+            (metadata or {}).get("files") or payload.get("files", None) or []
+        )
+        if attached_files:
+            payload_before_openai_file_injection = copy.deepcopy(payload)
+        payload = await inject_openai_files_into_messages(
+            request,
+            payload,
+            metadata,
+            user,
+            idx=idx,
+        )
 
+    api_version = None
     if api_config.get("azure", False):
         api_version = api_config.get("api_version", "2023-03-15-preview")
-        request_url, payload = convert_to_azure_payload(url, payload, api_version)
 
         # Only set api-key header if not using Azure Entra ID authentication
         auth_type = api_config.get("auth_type", "bearer")
@@ -1077,19 +1784,33 @@ async def generate_chat_completion(
 
         headers["api-version"] = api_version
 
-        if is_responses:
-            payload = convert_to_responses_payload(payload)
-            request_url = f"{request_url}/responses?api-version={api_version}"
-        else:
-            request_url = f"{request_url}/chat/completions?api-version={api_version}"
-    else:
-        if is_responses:
-            payload = convert_to_responses_payload(payload)
-            request_url = f"{url}/responses"
-        else:
-            request_url = f"{url}/chat/completions"
+    def build_openai_request(base_payload: dict) -> tuple[str, str]:
+        outbound_payload = copy.deepcopy(base_payload)
 
-    payload = json.dumps(payload)
+        if api_config.get("azure", False):
+            request_url_local, outbound_payload = convert_to_azure_payload(
+                url, outbound_payload, api_version
+            )
+
+            if is_responses:
+                outbound_payload = convert_to_responses_payload(outbound_payload)
+                request_url_local = (
+                    f"{request_url_local}/responses?api-version={api_version}"
+                )
+            else:
+                request_url_local = (
+                    f"{request_url_local}/chat/completions?api-version={api_version}"
+                )
+        else:
+            if is_responses:
+                outbound_payload = convert_to_responses_payload(outbound_payload)
+                request_url_local = f"{url}/responses"
+            else:
+                request_url_local = f"{url}/chat/completions"
+
+        return request_url_local, json.dumps(outbound_payload)
+
+    request_url, payload = build_openai_request(payload)
 
     r = None
     session = None
@@ -1097,33 +1818,65 @@ async def generate_chat_completion(
     response = None
 
     try:
-        session = aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        )
+        retry_attempted = False
 
-        r = await session.request(
-            method="POST",
-            url=request_url,
-            data=payload,
-            headers=headers,
-            cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-        )
-
-        # Check if response is SSE
-        if "text/event-stream" in r.headers.get("Content-Type", ""):
-            streaming = True
-            return StreamingResponse(
-                stream_wrapper(r, session, stream_chunks_handler),
-                status_code=r.status,
-                headers=dict(r.headers),
+        while True:
+            session = aiohttp.ClientSession(
+                trust_env=True,
+                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
             )
-        else:
+
+            r = await session.request(
+                method="POST",
+                url=request_url,
+                data=payload,
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            )
+
+            # Check if response is SSE
+            if "text/event-stream" in r.headers.get("Content-Type", ""):
+                streaming = True
+                return StreamingResponse(
+                    stream_wrapper(r, session, stream_sse_lines),
+                    status_code=r.status,
+                    headers=dict(r.headers),
+                )
+
             try:
                 response = await r.json()
             except Exception as e:
                 log.error(e)
                 response = await r.text()
+
+            if (
+                r.status >= 400
+                and is_responses
+                and attached_files
+                and payload_before_openai_file_injection is not None
+                and not retry_attempted
+                and is_unknown_file_id_error(response)
+            ):
+                log.info(
+                    "Retrying /responses request after stale upstream file id for chat_id=%s",
+                    (metadata or {}).get("chat_id"),
+                )
+                retry_attempted = True
+                await cleanup_response(r, session)
+                r = None
+                session = None
+
+                invalidate_cached_openai_file_ids(attached_files)
+                refreshed_payload = await inject_openai_files_into_messages(
+                    request,
+                    copy.deepcopy(payload_before_openai_file_injection),
+                    metadata,
+                    user,
+                    idx=idx,
+                )
+                request_url, payload = build_openai_request(refreshed_payload)
+                continue
 
             if r.status >= 400:
                 if isinstance(response, (dict, list)):
@@ -1203,7 +1956,7 @@ async def embeddings(request: Request, form_data: dict, user):
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, session),
+                stream_wrapper(r, session, stream_sse_lines),
                 status_code=r.status,
                 headers=dict(r.headers),
             )
@@ -1256,18 +2009,106 @@ class ResponsesForm(BaseModel):
 @router.post("/responses")
 async def responses(
     request: Request,
-    form_data: ResponsesForm,
+    form_data: dict,
     user=Depends(get_verified_user),
 ):
     """
     Forward requests to the OpenAI Responses API endpoint.
     Routes to the correct upstream backend based on the model field.
+
+    If the caller still sends Chat Completions-shaped payloads, reuse the
+    existing chat route so the browser can switch to /responses without
+    breaking the current frontend request shape.
     """
-    payload = form_data.model_dump(exclude_none=True)
+    payload = dict(form_data or {})
+    raw_payload_keys = sorted(payload.keys())
+    debug_info = {
+        "raw_payload_keys": raw_payload_keys,
+    }
+
+    if "messages" in payload:
+        return await process_openai_responses_chat_compatibility(
+            request, payload, user
+        )
+
+    # Some callers still send Chat-Completions-style tuning knobs nested under
+    # `params`, which the Responses API rejects as an unsupported top-level key.
+    # Normalize those values into the Responses payload and drop `params`.
+    incoming_params = payload.pop("params", None)
+    debug_info["incoming_params"] = summarize_response_debug_value(incoming_params)
+    if isinstance(incoming_params, dict) and incoming_params:
+        payload = apply_model_params_to_body_responses(incoming_params, payload)
+
+    legacy_params = {}
+    if "reasoning_effort" in payload:
+        legacy_params["reasoning_effort"] = payload.pop("reasoning_effort")
+    if "max_tokens" in payload:
+        legacy_params["max_tokens"] = payload.pop("max_tokens")
+    if legacy_params:
+        payload = apply_model_params_to_body_responses(legacy_params, payload)
+
+    model_id = payload.get("model", "")
+    debug_info["model_id"] = model_id
+    model_info = Models.get_model_by_id(model_id)
+
+    if model_info:
+        debug_info["model_found"] = True
+        if model_info.base_model_id:
+            base_model_id = (
+                request.base_model_id
+                if hasattr(request, "base_model_id")
+                else model_info.base_model_id
+            )
+            payload["model"] = base_model_id
+            model_id = base_model_id
+            debug_info["resolved_model_id"] = model_id
+
+        params = model_info.params.model_dump()
+        debug_info["model_params"] = summarize_response_debug_value(params)
+        if params:
+            payload = apply_model_params_to_body_responses(params, payload)
+
+        if not BYPASS_MODEL_ACCESS_CONTROL and user.role == "user":
+            user_group_ids = {
+                group.id for group in Groups.get_groups_by_member_id(user.id)
+            }
+            if not (
+                user.id == model_info.user_id
+                or AccessGrants.has_access(
+                    user_id=user.id,
+                    resource_type="model",
+                    resource_id=model_info.id,
+                    permission="read",
+                    user_group_ids=user_group_ids,
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Model not found",
+                )
+    elif not BYPASS_MODEL_ACCESS_CONTROL and user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Model not found",
+        )
+    else:
+        debug_info["model_found"] = False
+
+    payload = apply_default_responses_reasoning_summary(model_id, payload)
+
+    debug_info["final_payload_keys"] = sorted(payload.keys())
+    debug_info["final_reasoning"] = summarize_response_debug_value(
+        payload.get("reasoning")
+    )
+    debug_info["final_has_params"] = "params" in payload
+    log.info(
+        "responses_debug request %s",
+        json.dumps(debug_info, ensure_ascii=False, default=str),
+    )
+
     body = json.dumps(payload)
 
     idx = 0
-    model_id = form_data.model
     if model_id:
         models = request.app.state.OPENAI_MODELS
         if not models or model_id not in models:
@@ -1325,7 +2166,7 @@ async def responses(
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, session),
+                stream_wrapper(r, session, stream_sse_lines),
                 status_code=r.status,
                 headers=dict(r.headers),
             )
@@ -1336,6 +2177,21 @@ async def responses(
                 response_data = await r.text()
 
             if r.status >= 400:
+                log.info(
+                    "responses_debug error %s",
+                    json.dumps(
+                        {
+                            **debug_info,
+                            "status": r.status,
+                            "request_url": request_url,
+                            "error_response": summarize_response_debug_value(
+                                response_data
+                            ),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                )
                 if isinstance(response_data, (dict, list)):
                     return JSONResponse(status_code=r.status, content=response_data)
                 else:
@@ -1435,7 +2291,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, session),
+                stream_wrapper(r, session, stream_sse_lines),
                 status_code=r.status,
                 headers=dict(r.headers),
             )

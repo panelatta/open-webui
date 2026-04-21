@@ -59,6 +59,9 @@ REDIS = None
 
 # Configure CORS for Socket.IO
 SOCKETIO_CORS_ORIGINS = "*" if CORS_ALLOW_ORIGIN == ["*"] else CORS_ALLOW_ORIGIN
+SOCKETIO_TRANSPORTS = (
+    ["polling", "websocket"] if ENABLE_WEBSOCKET_SUPPORT else ["polling"]
+)
 
 if WEBSOCKET_MANAGER == "redis":
     if WEBSOCKET_SENTINEL_HOSTS:
@@ -75,7 +78,7 @@ if WEBSOCKET_MANAGER == "redis":
     sio = socketio.AsyncServer(
         cors_allowed_origins=SOCKETIO_CORS_ORIGINS,
         async_mode="asgi",
-        transports=(["websocket"] if ENABLE_WEBSOCKET_SUPPORT else ["polling"]),
+        transports=SOCKETIO_TRANSPORTS,
         allow_upgrades=ENABLE_WEBSOCKET_SUPPORT,
         always_connect=True,
         client_manager=mgr,
@@ -88,7 +91,7 @@ else:
     sio = socketio.AsyncServer(
         cors_allowed_origins=SOCKETIO_CORS_ORIGINS,
         async_mode="asgi",
-        transports=(["websocket"] if ENABLE_WEBSOCKET_SUPPORT else ["polling"]),
+        transports=SOCKETIO_TRANSPORTS,
         allow_upgrades=ENABLE_WEBSOCKET_SUPPORT,
         always_connect=True,
         logger=WEBSOCKET_SERVER_LOGGING,

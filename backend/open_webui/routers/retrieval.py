@@ -124,6 +124,23 @@ from open_webui.constants import ERROR_MESSAGES
 
 log = logging.getLogger(__name__)
 
+
+def _get_auto_full_context_max_chars() -> int:
+    try:
+        return max(0, int(os.getenv("AUTO_FULL_CONTEXT_MAX_CHARS", "20000")))
+    except (TypeError, ValueError):
+        return 20000
+
+
+AUTO_FULL_CONTEXT_MAX_CHARS = _get_auto_full_context_max_chars()
+
+
+def _should_auto_use_full_context(text_content: Optional[str]) -> bool:
+    if AUTO_FULL_CONTEXT_MAX_CHARS <= 0:
+        return False
+
+    return len(text_content or "") <= AUTO_FULL_CONTEXT_MAX_CHARS
+
 ##########################################
 #
 # Utility functions
@@ -1673,7 +1690,8 @@ def process_file(
 
     if file:
         try:
-
+            # Force uploaded files to bypass vector indexing and go straight
+            # into prompt context. This avoids slow embedding/indexing work.
             collection_name = form_data.collection_name
 
             if collection_name is None:
@@ -1682,15 +1700,6 @@ def process_file(
             if form_data.content:
                 # Update the content in the file
                 # Usage: /files/{file_id}/data/content/update, /files/ (audio file upload pipeline)
-
-                try:
-                    # /files/{file_id}/data/content/update
-                    VECTOR_DB_CLIENT.delete_collection(
-                        collection_name=f"file-{file.id}"
-                    )
-                except:
-                    # Audio file upload pipeline
-                    pass
 
                 docs = [
                     Document(
@@ -1710,31 +1719,18 @@ def process_file(
                 # Check if the file has already been processed and save the content
                 # Usage: /knowledge/{id}/file/add, /knowledge/{id}/file/update
 
-                result = VECTOR_DB_CLIENT.query(
-                    collection_name=f"file-{file.id}", filter={"file_id": file.id}
-                )
-
-                if result is not None and len(result.ids[0]) > 0:
-                    docs = [
-                        Document(
-                            page_content=result.documents[0][idx],
-                            metadata=result.metadatas[0][idx],
-                        )
-                        for idx, id in enumerate(result.ids[0])
-                    ]
-                else:
-                    docs = [
-                        Document(
-                            page_content=file.data.get("content", ""),
-                            metadata={
-                                **file.meta,
-                                "name": file.filename,
-                                "created_by": file.user_id,
-                                "file_id": file.id,
-                                "source": file.filename,
-                            },
-                        )
-                    ]
+                docs = [
+                    Document(
+                        page_content=file.data.get("content", ""),
+                        metadata={
+                            **file.meta,
+                            "name": file.filename,
+                            "created_by": file.user_id,
+                            "file_id": file.id,
+                            "source": file.filename,
+                        },
+                    )
+                ]
 
                 text_content = file.data.get("content", "")
             else:
@@ -1811,70 +1807,17 @@ def process_file(
             log.debug(f"text_content: {text_content}")
             Files.update_file_data_by_id(
                 file.id,
-                {"content": text_content},
+                {"content": text_content, "context_mode": "full", "status": "completed"},
                 db=db,
             )
             hash = calculate_sha256_string(text_content)
-
-            if request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
-                Files.update_file_data_by_id(file.id, {"status": "completed"}, db=db)
-                Files.update_file_hash_by_id(file.id, hash, db=db)
-                return {
-                    "status": True,
-                    "collection_name": None,
-                    "filename": file.filename,
-                    "content": text_content,
-                }
-            else:
-                try:
-                    # Commit any pending changes before the slow embedding step.
-                    # Note: file is already a Pydantic model (not ORM), so no expunge needed.
-                    db.commit()
-
-                    # External embedding API takes time (5-60s+).
-                    # Subsequent updates use fresh sessions via get_db().
-                    result = save_docs_to_vector_db(
-                        request,
-                        docs=docs,
-                        collection_name=collection_name,
-                        metadata={
-                            "file_id": file.id,
-                            "name": file.filename,
-                            "hash": hash,
-                        },
-                        add=(True if form_data.collection_name else False),
-                        user=user,
-                    )
-                    log.info(f"added {len(docs)} items to collection {collection_name}")
-
-                    if result:
-                        # Fresh session for the final update.
-                        with get_db() as session:
-                            Files.update_file_metadata_by_id(
-                                file.id,
-                                {
-                                    "collection_name": collection_name,
-                                },
-                                db=session,
-                            )
-
-                            Files.update_file_data_by_id(
-                                file.id,
-                                {"status": "completed"},
-                                db=session,
-                            )
-                            Files.update_file_hash_by_id(file.id, hash, db=session)
-
-                            return {
-                                "status": True,
-                                "collection_name": collection_name,
-                                "filename": file.filename,
-                                "content": text_content,
-                            }
-                    else:
-                        raise Exception("Error saving document to vector database")
-                except Exception as e:
-                    raise e
+            Files.update_file_hash_by_id(file.id, hash, db=db)
+            return {
+                "status": True,
+                "collection_name": None,
+                "filename": file.filename,
+                "content": text_content,
+            }
 
         except Exception as e:
             log.exception(e)
@@ -2774,12 +2717,8 @@ async def process_files_batch(
     user=Depends(get_verified_user),
 ) -> BatchProcessFilesResponse:
     """
-    Process a batch of files and save them to the vector database.
-
-    NOTE: We intentionally do NOT use Depends(get_session) here.
-    The save_docs_to_vector_db() call makes external embedding API calls which
-    can take 5-60+ seconds for batch operations. Database operations after
-    embedding (Files.update_file_by_id) manage their own short-lived sessions.
+    Process a batch of files and store their extracted text directly on the
+    file records without building vector indexes.
     """
 
     collection_name = form_data.collection_name
@@ -2846,28 +2785,20 @@ async def process_files_batch(
                 BatchProcessFilesResult(file_id=file.id, status="failed", error=str(e))
             )
 
-    # Save all documents in one batch
     if all_docs:
-        try:
-            await run_in_threadpool(
-                save_docs_to_vector_db,
-                request,
-                all_docs,
-                collection_name,
-                add=True,
-                user=user,
-            )
-
-            # Update all files with collection name
-            for file_update, file_result in zip(file_updates, file_results):
+        for file_update, file_result in zip(file_updates, file_results):
+            try:
+                file_update.data = {
+                    **(file_update.data or {}),
+                    "context_mode": "full",
+                    "status": "completed",
+                }
                 Files.update_file_by_id(id=file_result.file_id, form_data=file_update)
                 file_result.status = "completed"
-
-        except Exception as e:
-            log.error(
-                f"process_files_batch: Error saving documents to vector DB: {str(e)}"
-            )
-            for file_result in file_results:
+            except Exception as e:
+                log.error(
+                    f"process_files_batch: Error updating file {file_result.file_id}: {str(e)}"
+                )
                 file_result.status = "failed"
                 file_errors.append(
                     BatchProcessFilesResult(

@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import inspect
 import json
 import logging
@@ -9,6 +10,7 @@ import sys
 import time
 import random
 import re
+import stat
 from uuid import uuid4
 
 
@@ -49,7 +51,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import Response, StreamingResponse
-from starlette.datastructures import Headers
+from starlette.datastructures import Headers, URL
 
 from starsessions import (
     SessionMiddleware as StarSessionsMiddleware,
@@ -526,6 +528,8 @@ from open_webui.utils.middleware import (
     build_chat_response_context,
     process_chat_payload,
     process_chat_response,
+    serialize_output,
+    build_responses_reasoning_placeholder,
 )
 from open_webui.utils.tools import set_tool_servers, set_terminal_servers
 
@@ -571,16 +575,101 @@ log = logging.getLogger(__name__)
 
 
 class SPAStaticFiles(StaticFiles):
+    @staticmethod
+    def _normalize_cache_path(path: str) -> str:
+        return path.lstrip("./")
+
+    @classmethod
+    def _should_disable_cache(cls, path: str) -> bool:
+        normalized_path = cls._normalize_cache_path(path)
+        return (
+            normalized_path == "index.html"
+            or normalized_path == "manifest.json"
+            or normalized_path == "_app/version.json"
+            or normalized_path.startswith("_app/")
+        )
+
+    @staticmethod
+    def _apply_no_store_headers(response: Response) -> Response:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        if "etag" in response.headers:
+            del response.headers["etag"]
+        if "last-modified" in response.headers:
+            del response.headers["last-modified"]
+        return response
+
+    @classmethod
+    def _build_file_response(
+        cls, path: str, full_path: str, stat_result, scope, status_code: int = 200
+    ) -> Response:
+        response = FileResponse(full_path, stat_result=stat_result, status_code=status_code)
+        if cls._should_disable_cache(path):
+            return cls._apply_no_store_headers(response)
+        return response
+
     async def get_response(self, path: str, scope):
         try:
-            return await super().get_response(path, scope)
+            if scope["method"] not in ("GET", "HEAD"):
+                raise HTTPException(status_code=405)
+
+            try:
+                full_path, stat_result = await anyio.to_thread.run_sync(
+                    self.lookup_path, path
+                )
+            except PermissionError:
+                raise HTTPException(status_code=401)
+            except OSError as exc:
+                if exc.errno == errno.ENAMETOOLONG:
+                    raise HTTPException(status_code=404)
+                raise exc
+
+            if stat_result and stat.S_ISREG(stat_result.st_mode):
+                return self._build_file_response(path, full_path, stat_result, scope)
+
+            if stat_result and stat.S_ISDIR(stat_result.st_mode) and self.html:
+                index_path = os.path.join(path, "index.html")
+                full_path, stat_result = await anyio.to_thread.run_sync(
+                    self.lookup_path, index_path
+                )
+                if stat_result is not None and stat.S_ISREG(stat_result.st_mode):
+                    if not scope["path"].endswith("/"):
+                        url = URL(scope=scope)
+                        url = url.replace(path=url.path + "/")
+                        return RedirectResponse(url=url)
+                    return self._build_file_response(
+                        index_path, full_path, stat_result, scope
+                    )
+
+            if self.html:
+                full_path, stat_result = await anyio.to_thread.run_sync(
+                    self.lookup_path, "404.html"
+                )
+                if stat_result and stat.S_ISREG(stat_result.st_mode):
+                    return self._build_file_response(
+                        "404.html", full_path, stat_result, scope, status_code=404
+                    )
+
+            raise HTTPException(status_code=404)
         except (HTTPException, StarletteHTTPException) as ex:
             if ex.status_code == 404:
                 if path.endswith(".js"):
                     # Return 404 for javascript files
                     raise ex
                 else:
-                    return await super().get_response("index.html", scope)
+                    try:
+                        full_path, stat_result = await anyio.to_thread.run_sync(
+                            self.lookup_path, "index.html"
+                        )
+                    except PermissionError:
+                        raise HTTPException(status_code=401)
+
+                    if stat_result and stat.S_ISREG(stat_result.st_mode):
+                        return self._build_file_response(
+                            "index.html", full_path, stat_result, scope
+                        )
+                    raise ex
             else:
                 raise ex
 
@@ -1852,6 +1941,28 @@ async def chat_completion(
                 request, form_data, user, metadata, model
             )
 
+            if (
+                form_data.get("stream")
+                and model_id.lower().startswith("gpt-5")
+                and metadata.get("session_id")
+                and metadata.get("chat_id")
+                and metadata.get("message_id")
+            ):
+                try:
+                    placeholder_output = [build_responses_reasoning_placeholder()]
+                    await get_event_emitter(metadata)(
+                        {
+                            "type": "chat:completion",
+                            "data": {
+                                "content": serialize_output(placeholder_output),
+                                "output": placeholder_output,
+                            },
+                        }
+                    )
+                    metadata["reasoning_placeholder_emitted"] = True
+                except Exception as e:
+                    log.debug(f"Failed to emit initial reasoning placeholder: {e}")
+
             response = await chat_completion_handler(request, form_data, user)
             if metadata.get("chat_id") and metadata.get("message_id"):
                 try:
@@ -2291,7 +2402,7 @@ async def update_webhook_url(form_data: UrlForm, user=Depends(get_admin_user)):
 async def get_app_version():
     return {
         "version": VERSION,
-        "deployment_id": DEPLOYMENT_ID,
+        "deployment_id": DEPLOYMENT_ID or app.state.instance_id,
     }
 
 

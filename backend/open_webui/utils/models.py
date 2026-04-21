@@ -37,6 +37,17 @@ logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 
 
+def _disable_openai_file_context(model: dict) -> dict:
+    info = model.get("info") or {}
+    meta = info.get("meta") or {}
+    capabilities = meta.get("capabilities") or {}
+    capabilities["file_context"] = False
+    meta["capabilities"] = capabilities
+    info["meta"] = meta
+    model["info"] = info
+    return model
+
+
 async def fetch_ollama_models(request: Request, user: UserModel = None):
     raw_ollama_models = await ollama.get_all_models(request, user=user)
     return [
@@ -56,7 +67,10 @@ async def fetch_ollama_models(request: Request, user: UserModel = None):
 
 async def fetch_openai_models(request: Request, user: UserModel = None):
     openai_response = await openai.get_all_models(request, user=user)
-    return openai_response["data"]
+    return [
+        _disable_openai_file_context(model)
+        for model in openai_response["data"]
+    ]
 
 
 async def get_all_base_models(request: Request, user: UserModel = None):
@@ -169,6 +183,13 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
                     model["name"] = custom_model.name
                     model["info"] = custom_model.model_dump()
 
+                    # Custom overrides can replace the base model metadata entirely.
+                    # Re-apply the OpenAI file-context guard so Responses-backed
+                    # models keep sending files upstream instead of falling back
+                    # to local retrieval/RAG.
+                    if model.get("owned_by") == "openai":
+                        _disable_openai_file_context(model)
+
                     action_ids = []
                     filter_ids = []
 
@@ -225,6 +246,9 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
                 del info["params"]
 
             model["info"] = info
+
+            if owned_by == "openai":
+                _disable_openai_file_context(model)
 
             action_ids = []
             filter_ids = []

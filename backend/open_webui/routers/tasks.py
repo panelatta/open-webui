@@ -332,6 +332,13 @@ async def generate_follow_ups(
         )
 
 
+@router.post("/follow_ups/completions")
+async def generate_follow_ups_compat(
+    request: Request, form_data: dict, user=Depends(get_verified_user)
+):
+    return await generate_follow_ups(request, form_data, user)
+
+
 @router.post("/tags/completions")
 async def generate_chat_tags(
     request: Request, form_data: dict, user=Depends(get_verified_user)

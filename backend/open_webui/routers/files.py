@@ -1,11 +1,13 @@
 import logging
 import os
+import time
 import uuid
 import json
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 import asyncio
+import requests
 
 from fastapi import (
     BackgroundTasks,
@@ -48,7 +50,13 @@ from open_webui.storage.provider import Storage
 
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
+from open_webui.env import (
+    ENABLE_FORWARD_USER_INFO_HEADERS,
+    FORWARD_SESSION_INFO_HEADER_CHAT_ID,
+    AIOHTTP_CLIENT_TIMEOUT,
+)
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.misc import strict_match_mime_type
 from pydantic import BaseModel
 
@@ -85,6 +93,132 @@ def _is_text_file(file_path: str, chunk_size: int = 8192) -> bool:
         return False
 
 
+def _get_openai_api_config_for_index(request: Request, idx: int):
+    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+    key = request.app.state.config.OPENAI_API_KEYS[idx]
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
+        str(idx),
+        request.app.state.config.OPENAI_API_CONFIGS.get(url, {}),
+    )
+    return url, key, api_config
+
+
+def _build_openai_file_upload_headers(
+    request: Request,
+    url: str,
+    key: Optional[str],
+    api_config: Optional[dict],
+    file_metadata: Optional[dict],
+    user,
+):
+    api_config = api_config or {}
+    headers = {
+        **(
+            {
+                "HTTP-Referer": "https://openwebui.com/",
+                "X-Title": "Open WebUI",
+            }
+            if "openrouter.ai" in url
+            else {}
+        ),
+    }
+
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
+        if file_metadata and file_metadata.get("chat_id"):
+            headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = file_metadata.get("chat_id")
+
+    auth_type = api_config.get("auth_type")
+    if auth_type == "none":
+        token = None
+    else:
+        token = key
+
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    if api_config.get("headers") and isinstance(api_config.get("headers"), dict):
+        headers = {**headers, **api_config.get("headers")}
+
+    headers.pop("Content-Type", None)
+    return headers
+
+
+def ensure_openai_file_id(
+    request: Request,
+    file_item,
+    *,
+    file_metadata: Optional[dict] = None,
+    user=None,
+    idx: int = 0,
+) -> str:
+    url, key, api_config = _get_openai_api_config_for_index(request, idx)
+    data = file_item.data or {}
+
+    if (
+        data.get("openai_file_id")
+        and data.get("openai_file_id_valid_for_next_request") is True
+        and data.get("openai_backend_index") == idx
+        and data.get("openai_api_base_url") == url
+    ):
+        return data["openai_file_id"]
+
+    if api_config.get("azure", False):
+        raise ValueError("Azure OpenAI file uploads are not supported by this override")
+
+    if not file_item.path:
+        raise ValueError("Local file path is missing")
+
+    file_path = Storage.get_file(file_item.path)
+    content_type = ((file_item.meta or {}).get("content_type") or "").strip()
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    headers = _build_openai_file_upload_headers(
+        request, url, key, api_config, file_metadata, user
+    )
+
+    with open(file_path, "rb") as fh:
+        response = requests.post(
+            f"{url}/files",
+            data={"purpose": "user_data"},
+            files={"file": (file_item.filename, fh, content_type)},
+            headers=headers,
+            timeout=AIOHTTP_CLIENT_TIMEOUT,
+        )
+
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = response.text
+
+    if response.status_code >= 400:
+        if isinstance(response_payload, dict):
+            error = response_payload.get("error", response_payload)
+        else:
+            error = response_payload
+        raise ValueError(f"Upstream file upload failed: {error}")
+
+    if not isinstance(response_payload, dict) or not response_payload.get("id"):
+        raise ValueError("Upstream file upload returned no file id")
+
+    openai_file_id = response_payload["id"]
+    Files.update_file_data_by_id(
+        file_item.id,
+        {
+            "openai_file_id": openai_file_id,
+            "openai_backend_index": idx,
+            "openai_api_base_url": url,
+            "openai_upload_status": "uploaded",
+            "openai_file_id_valid_for_next_request": True,
+            "openai_uploaded_at": int(time.time()),
+            "status": "completed",
+            "error": None,
+        },
+    )
+    return openai_file_id
+
+
 def process_uploaded_file(
     request,
     file,
@@ -96,55 +230,13 @@ def process_uploaded_file(
 ):
     def _process_handler(db_session):
         try:
-            content_type = file.content_type
-
-            # Detect mis-labeled text files (e.g. .ts → video/mp2t)
-            if content_type and content_type.startswith(("image/", "video/")):
-                if _is_text_file(file_path):
-                    content_type = "text/plain"
-
-            if content_type:
-                stt_supported_content_types = getattr(
-                    request.app.state.config, "STT_SUPPORTED_CONTENT_TYPES", []
-                )
-
-                if strict_match_mime_type(stt_supported_content_types, content_type):
-                    file_path_processed = Storage.get_file(file_path)
-                    result = transcribe(
-                        request, file_path_processed, file_metadata, user
-                    )
-
-                    process_file(
-                        request,
-                        ProcessFileForm(
-                            file_id=file_item.id, content=result.get("text", "")
-                        ),
-                        user=user,
-                        db=db_session,
-                    )
-                elif (not content_type.startswith(("image/", "video/"))) or (
-                    request.app.state.config.CONTENT_EXTRACTION_ENGINE == "external"
-                ):
-                    process_file(
-                        request,
-                        ProcessFileForm(file_id=file_item.id),
-                        user=user,
-                        db=db_session,
-                    )
-                else:
-                    raise Exception(
-                        f"File type {content_type} is not supported for processing"
-                    )
-            else:
-                log.info(
-                    f"File type {file.content_type} is not provided, but trying to process anyway"
-                )
-                process_file(
-                    request,
-                    ProcessFileForm(file_id=file_item.id),
-                    user=user,
-                    db=db_session,
-                )
+            ensure_openai_file_id(
+                request,
+                file_item,
+                idx=0,
+                file_metadata=file_metadata,
+                user=user,
+            )
 
         except Exception as e:
             log.error(f"Error processing file: {file_item.id}")
@@ -197,7 +289,7 @@ def upload_file_handler(
     background_tasks: Optional[BackgroundTasks] = None,
     db: Optional[Session] = None,
 ):
-    log.info(f"file.content_type: {file.content_type} {process}")
+    log.info(f"file.content_type: {file.content_type} openai_upload")
 
     if isinstance(metadata, str):
         try:
@@ -279,37 +371,32 @@ def upload_file_handler(
                     channel.id, file_item.id, user.id, db=db
                 )
 
-        if process:
-            if background_tasks and process_in_background:
-                background_tasks.add_task(
-                    process_uploaded_file,
-                    request,
-                    file,
-                    file_path,
-                    file_item,
-                    file_metadata,
-                    user,
-                )
-                return {"status": True, **file_item.model_dump()}
-            else:
-                process_uploaded_file(
-                    request,
-                    file,
-                    file_path,
-                    file_item,
-                    file_metadata,
-                    user,
-                    db=db,
-                )
-                return {"status": True, **file_item.model_dump()}
-        else:
-            if file_item:
-                return file_item
-            else:
+        process_uploaded_file(
+            request,
+            file,
+            file_path,
+            file_item,
+            file_metadata,
+            user,
+            db=db,
+        )
+
+        file_item = Files.get_file_by_id(file_item.id, db=db)
+        if file_item:
+            file_data = file_item.data or {}
+            if file_data.get("status") == "failed":
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
+                    detail=ERROR_MESSAGES.DEFAULT(
+                        file_data.get("error", "Upstream file upload failed")
+                    ),
                 )
+            return {"status": True, **file_item.model_dump()}
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
+        )
 
     except HTTPException as e:
         raise e

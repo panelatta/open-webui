@@ -456,23 +456,28 @@ def serialize_output(output: list) -> str:
             pass
 
         elif item_type == "reasoning":
-            reasoning_content = ""
-            # Check for 'summary' (new structure) or 'content' (legacy/fallback)
-            source_list = item.get("summary", []) or item.get("content", [])
-            for content_part in source_list:
-                if "text" in content_part:
-                    reasoning_content += content_part.get("text", "")
-                elif "summary" in content_part:  # Handle potential nested logic if any
-                    pass
+            def collect_reasoning_text(parts: list) -> str:
+                reasoning_parts = []
+                for content_part in parts or []:
+                    text = content_part.get("text", "")
+                    if text and text.strip():
+                        reasoning_parts.append(text.strip())
+                return "\n\n".join(reasoning_parts).strip()
 
-            reasoning_content = reasoning_content.strip()
+            summary_reasoning = collect_reasoning_text(item.get("summary", []))
+            body_reasoning = collect_reasoning_text(item.get("content", []))
+            reasoning_content = summary_reasoning or body_reasoning
+            has_visible_reasoning = bool(reasoning_content)
 
             duration = item.get("duration")
             status = item.get("status", "in_progress")
 
-            # Infer completion: if this reasoning item is NOT the last item,
-            # render as done (a subsequent item means reasoning is complete)
             is_last_item = idx == len(output) - 1
+            should_render_completed = has_visible_reasoning and status == "completed"
+            should_render_placeholder = status != "completed"
+
+            if not should_render_completed and not should_render_placeholder:
+                continue
 
             if content and not content.endswith("\n"):
                 content += "\n"
@@ -484,8 +489,13 @@ def serialize_output(output: list) -> str:
                 )
             )
 
-            if status == "completed" or duration is not None or not is_last_item:
-                content = f'{content}<details type="reasoning" done="true" duration="{duration or 0}">\n<summary>Thought for {duration or 0} seconds</summary>\n{display}\n</details>\n'
+            if should_render_completed:
+                summary_text = (
+                    "Thought for less than a second"
+                    if duration is not None and duration < 1
+                    else f"Thought for {duration or 0} seconds"
+                )
+                content = f'{content}<details type="reasoning" done="true" duration="{duration or 0}">\n<summary>{summary_text}</summary>\n{display}\n</details>\n'
             else:
                 content = f'{content}<details type="reasoning" done="false">\n<summary>Thinking…</summary>\n{display}\n</details>\n'
 
@@ -534,6 +544,88 @@ def serialize_output(output: list) -> str:
     return content.strip()
 
 
+def normalize_responses_output_item(item: dict, previous_item: dict | None = None) -> dict:
+    normalized_item = copy.deepcopy(item)
+
+    if normalized_item.get("type") != "reasoning":
+        return normalized_item
+
+    normalized_item.pop("encrypted_content", None)
+    normalized_item.setdefault("status", "in_progress")
+
+    started_at = None
+    if previous_item and isinstance(previous_item, dict):
+        started_at = previous_item.get("started_at")
+        if started_at is not None:
+            normalized_item.setdefault("started_at", started_at)
+
+        if previous_item.get("summary") and not normalized_item.get("summary"):
+            normalized_item["summary"] = copy.deepcopy(previous_item["summary"])
+
+        if previous_item.get("content") and not normalized_item.get("content"):
+            normalized_item["content"] = copy.deepcopy(previous_item["content"])
+
+    normalized_item.setdefault("started_at", time.time())
+    return keep_reasoning_item_in_progress(normalized_item)
+
+
+def is_transient_reasoning_placeholder(item: dict | None) -> bool:
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "reasoning"
+        and item.get("_placeholder") is True
+    )
+
+
+def build_responses_reasoning_placeholder() -> dict:
+    return {
+        "type": "reasoning",
+        "id": output_id("rs"),
+        "status": "in_progress",
+        "summary": [],
+        "content": [],
+        "started_at": time.time(),
+        "_placeholder": True,
+    }
+
+
+def keep_reasoning_item_in_progress(item: dict) -> dict:
+    if not isinstance(item, dict) or item.get("type") != "reasoning":
+        return item
+
+    item.pop("encrypted_content", None)
+    item["status"] = "in_progress"
+    item.pop("ended_at", None)
+    item.pop("duration", None)
+    return item
+
+
+def finalize_output_items(output: list, ended_at: float | None = None) -> list:
+    completed_at = ended_at or time.time()
+
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+
+        item.pop("_placeholder", None)
+
+        if item.get("type") == "reasoning":
+            item.pop("encrypted_content", None)
+            item["status"] = "completed"
+
+            started_at = item.get("started_at")
+            item["ended_at"] = item.get("ended_at", completed_at)
+            item["duration"] = (
+                max(0, int(item["ended_at"] - started_at))
+                if started_at is not None
+                else 0
+            )
+        elif item.get("status") == "in_progress":
+            item["status"] = "completed"
+
+    return output
+
+
 def deep_merge(target, source):
     """
     Merge source into target recursively (returning new structure).
@@ -553,6 +645,26 @@ def deep_merge(target, source):
         return target + source
     else:
         return source
+
+
+def extract_first_json_object(text: str) -> Optional[dict]:
+    if not isinstance(text, str):
+        return None
+
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+
+        try:
+            value, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(value, dict):
+            return value
+
+    return None
 
 
 def handle_responses_streaming_event(
@@ -579,9 +691,19 @@ def handle_responses_streaming_event(
 
     if event_type == "response.output_item.added":
         item = data.get("item", {})
+        output_index = data.get("output_index")
         if item:
             new_output = list(current_output)
-            new_output.append(item)
+            if (
+                isinstance(output_index, int)
+                and 0 <= output_index < len(current_output)
+                and is_transient_reasoning_placeholder(current_output[output_index])
+            ):
+                new_output[output_index] = normalize_responses_output_item(
+                    item, current_output[output_index]
+                )
+            else:
+                new_output.append(normalize_responses_output_item(item))
             return new_output, None
         return current_output, None
 
@@ -838,7 +960,27 @@ def handle_responses_streaming_event(
                                     item["content"][content_index] = part
                                     part[key] = final_value
                         elif item_type == "reasoning":
-                            item["status"] = "completed"
+                            if type_name == "reasoning_summary_text":
+                                summary_index = data.get("summary_index", 0)
+                                item["summary"] = list(item.get("summary") or [])
+                                while len(item["summary"]) <= summary_index:
+                                    item["summary"].append(
+                                        {"type": "summary_text", "text": ""}
+                                    )
+                                part = item["summary"][summary_index].copy()
+                                item["summary"][summary_index] = part
+                                part[key] = final_value
+                            elif type_name == "reasoning_text":
+                                content_index = data.get("content_index", 0)
+                                item["content"] = list(item.get("content") or [])
+                                while len(item["content"]) <= content_index:
+                                    item["content"].append(
+                                        {"type": "text", "text": ""}
+                                    )
+                                part = item["content"][content_index].copy()
+                                item["content"][content_index] = part
+                                part[key] = final_value
+                            keep_reasoning_item_in_progress(item)
                         else:
                             item[key] = final_value
 
@@ -853,26 +995,24 @@ def handle_responses_streaming_event(
 
         new_output = list(current_output)
         if item and 0 <= output_index < len(current_output):
-            new_output[output_index] = item
+            normalized_item = normalize_responses_output_item(
+                item, current_output[output_index]
+            )
+            if normalized_item.get("type") == "reasoning":
+                normalized_item = keep_reasoning_item_in_progress(normalized_item)
+            new_output[output_index] = normalized_item
         elif item:
-            new_output.append(item)
+            normalized_item = normalize_responses_output_item(item)
+            if normalized_item.get("type") == "reasoning":
+                normalized_item = keep_reasoning_item_in_progress(normalized_item)
+            new_output.append(normalized_item)
         return new_output, {}
 
     elif event_type == "response.completed":
         # State Machine Event: Completed
         response_data = data.get("response", {})
-        final_output = response_data.get("output")
-
-        new_output = final_output if final_output is not None else current_output
-
-        # Ensure reasoning items are marked as completed in the final output
-        if new_output:
-            for item in new_output:
-                if (
-                    item.get("type") == "reasoning"
-                    and item.get("status") != "completed"
-                ):
-                    item["status"] = "completed"
+        new_output = list(current_output)
+        finalize_output_items(new_output)
 
         return new_output, {"usage": response_data.get("usage"), "done": True}
 
@@ -1288,6 +1428,10 @@ async def chat_completion_tools_handler(
                     }
 
                     if tool.get("direct", False):
+                        if not event_caller:
+                            raise RuntimeError(
+                                "Direct tool execution requires an active websocket session."
+                            )
                         tool_result = await event_caller(
                             {
                                 "type": "execute:tool",
@@ -2964,12 +3108,11 @@ async def background_tasks_handler(ctx):
                     else:
                         follow_ups_string = ""
 
-                    follow_ups_string = follow_ups_string[
-                        follow_ups_string.find("{") : follow_ups_string.rfind("}") + 1
-                    ]
-
                     try:
-                        follow_ups = json.loads(follow_ups_string).get("follow_ups", [])
+                        follow_ups_payload = (
+                            extract_first_json_object(follow_ups_string) or {}
+                        )
+                        follow_ups = follow_ups_payload.get("follow_ups", [])
                         await event_emitter(
                             {
                                 "type": "chat:message:follow_ups",
@@ -3027,14 +3170,11 @@ async def background_tasks_handler(ctx):
                             else:
                                 title_string = ""
 
-                            title_string = title_string[
-                                title_string.find("{") : title_string.rfind("}") + 1
-                            ]
-
                             try:
-                                title = json.loads(title_string).get(
-                                    "title", user_message
+                                title_payload = (
+                                    extract_first_json_object(title_string) or {}
                                 )
+                                title = title_payload.get("title", user_message)
                             except Exception as e:
                                 title = ""
 
@@ -3085,12 +3225,9 @@ async def background_tasks_handler(ctx):
                         else:
                             tags_string = ""
 
-                        tags_string = tags_string[
-                            tags_string.find("{") : tags_string.rfind("}") + 1
-                        ]
-
                         try:
-                            tags = json.loads(tags_string).get("tags", [])
+                            tags_payload = extract_first_json_object(tags_string) or {}
+                            tags = tags_payload.get("tags", [])
                             Chats.update_chat_tags_by_id(
                                 metadata["chat_id"], tags, user
                             )
@@ -3479,11 +3616,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 item["content"] = [
                                     {"type": "output_text", "text": block_content}
                                 ]
-                                item["ended_at"] = time.time()
-                                item["duration"] = int(
-                                    item["ended_at"] - item["started_at"]
-                                )
-                                item["status"] = "completed"
+                                keep_reasoning_item_in_progress(item)
                             elif last_type == "open_webui:code_interpreter":
                                 item["code"] = block_content
                                 item["ended_at"] = time.time()
@@ -3607,6 +3740,22 @@ async def streaming_chat_response_handler(response, ctx):
                         },
                     )
 
+                if (
+                    not output
+                    and model_id.lower().startswith("gpt-5")
+                    and not metadata.get("reasoning_placeholder_emitted")
+                ):
+                    output = [build_responses_reasoning_placeholder()]
+                    await event_emitter(
+                        {
+                            "type": "chat:completion",
+                            "data": {
+                                "content": serialize_output(output),
+                                "output": output,
+                            },
+                        }
+                    )
+
                 async def stream_body_handler(response, form_data):
                     nonlocal content
                     nonlocal usage
@@ -3696,9 +3845,15 @@ async def streaming_chat_response_handler(response, ctx):
                                     )
 
                                     processed_data = {
-                                        "output": output,
                                         "content": serialize_output(output),
                                     }
+
+                                    if data.get("type") in {
+                                        "response.output_item.done",
+                                        "response.completed",
+                                        "response.failed",
+                                    }:
+                                        processed_data["output"] = output
 
                                     # print(data)
                                     # print(processed_data)
@@ -3954,14 +4109,13 @@ async def streaming_chat_response_handler(response, ctx):
                                             .get("type")
                                             == "reasoning_content"
                                         ):
-                                            reasoning_item = output[-1]
-                                            reasoning_item["ended_at"] = time.time()
-                                            reasoning_item["duration"] = int(
-                                                reasoning_item["ended_at"]
-                                                - reasoning_item["started_at"]
-                                            )
-                                            reasoning_item["status"] = "completed"
-
+                                            # Keep the reasoning block in-progress
+                                            # while the assistant message begins to
+                                            # stream. Finalize it only when the
+                                            # overall stream actually completes, so
+                                            # the UI continues showing "Thinking..."
+                                            # instead of switching early to a
+                                            # 0-second completed placeholder.
                                             output.append(
                                                 {
                                                     "type": "message",
@@ -4186,13 +4340,7 @@ async def streaming_chat_response_handler(response, ctx):
 
                         if output[-1].get("type") == "reasoning":
                             reasoning_item = output[-1]
-                            if reasoning_item.get("ended_at") is None:
-                                reasoning_item["ended_at"] = time.time()
-                                reasoning_item["duration"] = int(
-                                    reasoning_item["ended_at"]
-                                    - reasoning_item["started_at"]
-                                )
-                                reasoning_item["status"] = "completed"
+                            keep_reasoning_item_in_progress(reasoning_item)
 
                     if response_tool_calls:
                         tool_calls.append(_split_tool_calls(response_tool_calls))
@@ -4325,6 +4473,10 @@ async def streaming_chat_response_handler(response, ctx):
                                 }
 
                                 if direct_tool:
+                                    if not event_caller:
+                                        raise RuntimeError(
+                                            "Direct tool execution requires an active websocket session."
+                                        )
                                     tool_result = await event_caller(
                                         {
                                             "type": "execute:tool",
@@ -4618,6 +4770,10 @@ async def streaming_chat_response_handler(response, ctx):
                                     request.app.state.config.CODE_INTERPRETER_ENGINE
                                     == "pyodide"
                                 ):
+                                    if not event_caller:
+                                        raise RuntimeError(
+                                            "Pyodide code execution requires an active websocket session."
+                                        )
                                     ci_output = await event_caller(
                                         {
                                             "type": "execute:python",
@@ -4748,10 +4904,7 @@ async def streaming_chat_response_handler(response, ctx):
                             log.debug(e)
                             break
 
-                # Mark all in-progress items as completed
-                for item in output:
-                    if item.get("status") == "in_progress":
-                        item["status"] = "completed"
+                finalize_output_items(output)
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 data = {
