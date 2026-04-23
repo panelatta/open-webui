@@ -10,6 +10,7 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 from aiocache import cached
+import requests
 
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
@@ -441,13 +442,13 @@ def _is_image_attachment(file_item: Optional[dict]) -> bool:
     return _extract_attachment_content_type(file_item).startswith("image/")
 
 
-def invalidate_cached_openai_file_ids(attached_files: list[dict]) -> None:
+async def invalidate_cached_openai_file_ids(attached_files: list[dict]) -> None:
     for attached_file in attached_files:
         local_file_id = _extract_attachment_file_id(attached_file)
         if not local_file_id:
             continue
 
-        Files.update_file_data_by_id(
+        await Files.update_file_data_by_id(
             local_file_id,
             {
                 "openai_file_id": None,
@@ -460,8 +461,8 @@ def invalidate_cached_openai_file_ids(attached_files: list[dict]) -> None:
         )
 
 
-def mark_openai_file_id_consumed(local_file_id: str) -> None:
-    Files.update_file_data_by_id(
+async def mark_openai_file_id_consumed(local_file_id: str) -> None:
+    await Files.update_file_data_by_id(
         local_file_id,
         {
             "openai_file_id_valid_for_next_request": False,
@@ -553,24 +554,10 @@ def upload_local_file_to_openai(
     if not isinstance(response_payload, dict) or not response_payload.get("id"):
         raise ValueError("Upstream file upload returned no file id")
 
-    openai_file_id = response_payload["id"]
-    Files.update_file_data_by_id(
-        file_item.id,
-        {
-            "openai_file_id": openai_file_id,
-            "openai_backend_index": idx,
-            "openai_api_base_url": url,
-            "openai_upload_status": "uploaded",
-            "openai_file_id_valid_for_next_request": True,
-            "openai_uploaded_at": int(time.time()),
-            "status": "completed",
-            "error": None,
-        },
-    )
-    return openai_file_id
+    return response_payload["id"]
 
 
-def ensure_openai_file_id(
+async def ensure_openai_file_id(
     request: Request,
     file_id: str,
     *,
@@ -578,17 +565,35 @@ def ensure_openai_file_id(
     metadata: Optional[dict] = None,
     user: Optional[UserModel] = None,
 ) -> Optional[str]:
-    file_item = Files.get_file_by_id(file_id)
+    file_item = await Files.get_file_by_id(file_id)
     if not file_item:
         return None
 
-    return upload_local_file_to_openai(
+    openai_file_id = await asyncio.to_thread(
+        upload_local_file_to_openai,
         request,
         file_item,
         idx=idx,
         metadata=metadata,
         user=user,
     )
+
+    if openai_file_id:
+        await Files.update_file_data_by_id(
+            file_item.id,
+            {
+                "openai_file_id": openai_file_id,
+                "openai_backend_index": idx,
+                "openai_api_base_url": request.app.state.config.OPENAI_API_BASE_URLS[idx],
+                "openai_upload_status": "uploaded",
+                "openai_file_id_valid_for_next_request": True,
+                "openai_uploaded_at": int(time.time()),
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+    return openai_file_id
 
 
 async def inject_openai_files_into_messages(
@@ -618,8 +623,7 @@ async def inject_openai_files_into_messages(
             continue
 
         try:
-            openai_file_id = await asyncio.to_thread(
-                ensure_openai_file_id,
+            openai_file_id = await ensure_openai_file_id(
                 request,
                 local_file_id,
                 idx=idx,
@@ -637,7 +641,7 @@ async def inject_openai_files_into_messages(
             # Treat upstream file ids as single-use for request routing.
             # This avoids a stale cached file id adding a failed /responses
             # attempt before we re-upload on the next turn.
-            await asyncio.to_thread(mark_openai_file_id_consumed, local_file_id)
+            await mark_openai_file_id_consumed(local_file_id)
 
     if not file_parts:
         return payload
