@@ -81,6 +81,17 @@ log = logging.getLogger(__name__)
 #
 ##########################################
 
+# Headers that become stale after aiohttp auto-decompresses the upstream
+# response body.  Forwarding them verbatim causes desktop / programmatic
+# clients to attempt decompression of an already-decoded payload, resulting
+# in ZlibError.  See https://github.com/aio-libs/aiohttp/issues/4462.
+_STRIP_PROXY_HEADERS = frozenset({'Content-Encoding', 'Content-Length', 'Transfer-Encoding'})
+
+
+def _clean_proxy_headers(raw_headers) -> dict:
+    """Return a copy of *raw_headers* with stale encoding headers removed."""
+    return {k: v for k, v in raw_headers.items() if k not in _STRIP_PROXY_HEADERS}
+
 
 async def send_get_request(
     request: Request = None,
@@ -1821,17 +1832,19 @@ async def generate_chat_completion(
             idx=idx,
         )
 
+    is_azure_v1 = False
     api_version = None
-    if api_config.get("azure", False):
-        api_version = api_config.get("api_version", "2023-03-15-preview")
-
     if api_config.get('azure', False):
+        api_version = api_config.get("api_version", "2023-03-15-preview")
+        is_azure_v1 = bool(re.search(r"/openai/v1(?:/|$)", url))
+
         # Only set api-key header if not using Azure Entra ID authentication
         auth_type = api_config.get("auth_type", "bearer")
         if auth_type not in ("azure_ad", "microsoft_entra_id"):
             headers["api-key"] = key
 
-        headers["api-version"] = api_version
+        if not is_azure_v1:
+            headers["api-version"] = api_version
 
     def build_openai_request(base_payload: dict) -> tuple[str, str]:
         outbound_payload = copy.deepcopy(base_payload)
@@ -1846,19 +1859,26 @@ async def generate_chat_completion(
                     )
 
         if api_config.get("azure", False):
-            request_url_local, outbound_payload = convert_to_azure_payload(
-                url, outbound_payload, api_version
-            )
-
-            if is_responses:
-                outbound_payload = convert_to_responses_payload(outbound_payload)
-                request_url_local = (
-                    f"{request_url_local}/responses?api-version={api_version}"
-                )
+            if is_azure_v1:
+                if is_responses:
+                    outbound_payload = convert_to_responses_payload(outbound_payload)
+                    request_url_local = f'{url.rstrip("/")}/responses'
+                else:
+                    request_url_local = f'{url.rstrip("/")}/chat/completions'
             else:
-                request_url_local = (
-                    f"{request_url_local}/chat/completions?api-version={api_version}"
+                request_url_local, outbound_payload = convert_to_azure_payload(
+                    url, outbound_payload, api_version
                 )
+
+                if is_responses:
+                    outbound_payload = convert_to_responses_payload(outbound_payload)
+                    request_url_local = (
+                        f"{request_url_local}/responses?api-version={api_version}"
+                    )
+                else:
+                    request_url_local = (
+                        f"{request_url_local}/chat/completions?api-version={api_version}"
+                    )
         else:
             if is_responses:
                 outbound_payload = convert_to_responses_payload(outbound_payload)
@@ -1879,10 +1899,7 @@ async def generate_chat_completion(
         retry_attempted = False
 
         while True:
-            session = aiohttp.ClientSession(
-                trust_env=True,
-                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
-            )
+            session = await get_session()
 
             r = await session.request(
                 method="POST",
@@ -1891,15 +1908,41 @@ async def generate_chat_completion(
                 headers=headers,
                 cookies=cookies,
                 ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
             )
 
             # Check if response is SSE
             if "text/event-stream" in r.headers.get("Content-Type", ""):
+                # If the provider returned an error status with SSE content-type,
+                # read the body and return a proper error response instead of
+                # streaming the error back (which hides the error from logs).
+                if r.status >= 400:
+                    error_body = await r.text()
+                    log.error(
+                        "Provider returned HTTP %d with SSE content-type: %s",
+                        r.status,
+                        error_body[:1000],
+                    )
+                    try:
+                        error_json = json.loads(error_body)
+                        return JSONResponse(status_code=r.status, content=error_json)
+                    except json.JSONDecodeError:
+                        return JSONResponse(
+                            status_code=r.status,
+                            content={
+                                "error": {
+                                    "message": error_body,
+                                    "code": r.status,
+                                }
+                            },
+                        )
+
                 streaming = True
+                content_handler = stream_sse_lines if is_responses else stream_chunks_handler
                 return StreamingResponse(
-                    stream_wrapper(r, session, stream_sse_lines),
+                    stream_wrapper(r, content_handler=content_handler),
                     status_code=r.status,
-                    headers=dict(r.headers),
+                    headers=_clean_proxy_headers(r.headers),
                 )
 
             try:
@@ -1921,11 +1964,10 @@ async def generate_chat_completion(
                     (metadata or {}).get("chat_id"),
                 )
                 retry_attempted = True
-                await cleanup_response(r, session)
+                await cleanup_response(r)
                 r = None
-                session = None
 
-                invalidate_cached_openai_file_ids(attached_files)
+                await invalidate_cached_openai_file_ids(attached_files)
                 refreshed_payload = await inject_openai_files_into_messages(
                     request,
                     copy.deepcopy(payload_before_openai_file_injection),
@@ -1956,7 +1998,7 @@ async def generate_chat_completion(
         )
     finally:
         if not streaming:
-            await cleanup_response(r, session)
+            await cleanup_response(r)
 
 
 async def embeddings(request: Request, form_data: dict, user):
@@ -2011,9 +2053,9 @@ async def embeddings(request: Request, form_data: dict, user):
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, session, stream_sse_lines),
+                stream_wrapper(r, content_handler=stream_sse_lines),
                 status_code=r.status,
-                headers=dict(r.headers),
+                headers=_clean_proxy_headers(r.headers),
             )
         else:
             try:
@@ -2036,7 +2078,7 @@ async def embeddings(request: Request, form_data: dict, user):
         )
     finally:
         if not streaming:
-            await cleanup_response(r, session)
+            await cleanup_response(r)
 
 
 class ResponsesForm(BaseModel):
@@ -2216,9 +2258,9 @@ async def responses(
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, session, stream_sse_lines),
+                stream_wrapper(r, content_handler=stream_sse_lines),
                 status_code=r.status,
-                headers=dict(r.headers),
+                headers=_clean_proxy_headers(r.headers),
             )
         else:
             try:
@@ -2259,7 +2301,7 @@ async def responses(
         )
     finally:
         if not streaming:
-            await cleanup_response(r, session)
+            await cleanup_response(r)
 
 
 @router.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE'])
@@ -2349,9 +2391,9 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, session, stream_sse_lines),
+                stream_wrapper(r, content_handler=stream_sse_lines),
                 status_code=r.status,
-                headers=dict(r.headers),
+                headers=_clean_proxy_headers(r.headers),
             )
         else:
             try:
@@ -2377,4 +2419,4 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
         )
     finally:
         if not streaming:
-            await cleanup_response(r, session)
+            await cleanup_response(r)
