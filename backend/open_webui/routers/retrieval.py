@@ -1562,10 +1562,10 @@ async def process_file(
     db: AsyncSession = Depends(get_async_session),
 ):
     """
-    Process a file and save its content to the vector database.
-    Process a file and save its content to the vector database.
-    Note: granular session management is used to prevent connection pool exhaustion.
-    The session is committed before external API calls, and updates use a fresh session.
+    Process a file and store extracted content on the file record.
+
+    Uploaded files intentionally bypass vector indexing and are used as
+    full prompt context instead of RAG chunks.
     """
     if user.role == 'admin':
         file = await Files.get_file_by_id(form_data.file_id, db=db)
@@ -1574,8 +1574,6 @@ async def process_file(
 
     if file:
         try:
-            # Force uploaded files to bypass vector indexing and go straight
-            # into prompt context. This avoids slow embedding/indexing work.
             collection_name = form_data.collection_name
 
             if collection_name is None:
@@ -2535,8 +2533,6 @@ async def process_files_batch(
     file records without building vector indexes.
     """
 
-    collection_name = form_data.collection_name
-
     file_results: List[BatchProcessFilesResult] = []
     file_errors: List[BatchProcessFilesResult] = []
     file_updates: List[FileUpdateForm] = []
@@ -2603,7 +2599,7 @@ async def process_files_batch(
                     "context_mode": "full",
                     "status": "completed",
                 }
-                Files.update_file_by_id(id=file_result.file_id, form_data=file_update)
+                await Files.update_file_by_id(id=file_result.file_id, form_data=file_update)
                 file_result.status = "completed"
             except Exception as e:
                 log.error(
