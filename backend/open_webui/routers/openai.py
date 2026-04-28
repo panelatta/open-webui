@@ -217,31 +217,6 @@ def apply_model_params_to_body_responses(params: dict, form_data: dict) -> dict:
     return form_data
 
 
-def apply_default_responses_reasoning_summary(
-    model: str | None, form_data: dict
-) -> dict:
-    if not model or not model.lower().startswith("gpt-5"):
-        return form_data
-
-    reasoning = form_data.get("reasoning")
-    if reasoning is None:
-        reasoning = {}
-    elif not isinstance(reasoning, dict):
-        reasoning = {}
-    else:
-        reasoning = reasoning.copy()
-
-    # Cherry Studio's GPT-5 requests effectively resolve to a detailed
-    # reasoning summary when summary streaming is available. Mirror that
-    # behavior here so Open WebUI has the best chance of receiving
-    # reasoning summary deltas instead of only a completed placeholder.
-    if reasoning.get("summary") in (None, "auto"):
-        reasoning["summary"] = "detailed"
-
-    form_data["reasoning"] = reasoning
-    return form_data
-
-
 def summarize_response_debug_value(value):
     if isinstance(value, str):
         return {"type": "str", "len": len(value)}
@@ -1474,11 +1449,6 @@ def convert_to_responses_payload(payload: dict) -> dict:
         reasoning["effort"] = responses_payload.pop("reasoning_effort")
         responses_payload["reasoning"] = reasoning
 
-    responses_payload = apply_default_responses_reasoning_summary(
-        responses_payload.get("model"),
-        responses_payload,
-    )
-
     # Remove Chat Completions-only parameters not supported by the Responses API
     for unsupported_key in (
         "params",
@@ -2188,8 +2158,6 @@ async def responses(
         )
     else:
         debug_info["model_found"] = False
-
-    payload = apply_default_responses_reasoning_summary(model_id, payload)
 
     debug_info["final_payload_keys"] = sorted(payload.keys())
     debug_info["final_reasoning"] = summarize_response_debug_value(
