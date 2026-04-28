@@ -36,6 +36,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission, filter_allowed_access_grants
+from open_webui.utils.models import get_all_models
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.internal.db import get_async_session
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -75,6 +76,35 @@ def _safe_static_redirect_path(url: str) -> Optional[str]:
 
 def is_valid_model_id(model_id: str) -> bool:
     return model_id and len(model_id) <= 256
+
+
+async def disable_file_context_for_openai_base_model(
+    request: Request, form_data: ModelForm, user
+) -> ModelForm:
+    if not form_data.base_model_id:
+        return form_data
+
+    runtime_models = getattr(request.app.state, 'MODELS', {}) or {}
+    base_model = runtime_models.get(form_data.base_model_id)
+
+    if base_model is None:
+        await get_all_models(request, refresh=True, user=user)
+        runtime_models = getattr(request.app.state, 'MODELS', {}) or {}
+        base_model = runtime_models.get(form_data.base_model_id)
+
+    if (
+        base_model is None
+        and isinstance(form_data.base_model_id, str)
+        and ':' in form_data.base_model_id
+    ):
+        base_model = runtime_models.get(form_data.base_model_id.split(':')[0])
+
+    if base_model and base_model.get('owned_by') == 'openai':
+        capabilities = dict(form_data.meta.capabilities or {})
+        capabilities['file_context'] = False
+        form_data.meta.capabilities = capabilities
+
+    return form_data
 
 
 ###########################
@@ -226,6 +256,9 @@ async def create_new_model(
             user.role,
             form_data.access_grants,
             'sharing.public_models',
+        )
+        form_data = await disable_file_context_for_openai_base_model(
+            request, form_data, user
         )
 
         model = await Models.insert_new_model(form_data, user.id, db=db)
@@ -586,6 +619,9 @@ async def update_model_by_id(
         user.role,
         form_data.access_grants,
         'sharing.public_models',
+    )
+    form_data = await disable_file_context_for_openai_base_model(
+        request, form_data, user
     )
 
     model = await Models.update_model_by_id(form_data.id, ModelForm(**form_data.model_dump()), db=db)

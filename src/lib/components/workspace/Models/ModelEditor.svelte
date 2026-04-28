@@ -98,6 +98,14 @@
 	let defaultFilterIds = [];
 
 	let capabilities = { ...DEFAULT_CAPABILITIES };
+	$: selectedBaseModel = info.base_model_id
+		? $models.find((model) => model.id === info.base_model_id)
+		: null;
+	$: openAIBaseModelSelected = selectedBaseModel?.owned_by === 'openai';
+	$: hiddenCapabilities = openAIBaseModelSelected ? ['file_context'] : [];
+	$: if (openAIBaseModelSelected && capabilities.file_context) {
+		capabilities = { ...capabilities, file_context: false };
+	}
 	let defaultFeatureIds = [];
 	let builtinTools = {};
 
@@ -136,7 +144,9 @@
 		info.params = { ...info.params, ...params };
 
 		info.access_grants = accessGrants;
-		info.meta.capabilities = capabilities;
+		info.meta.capabilities = openAIBaseModelSelected
+			? { ...capabilities, file_context: false }
+			: capabilities;
 
 		if (enableDescription) {
 			info.meta.description = info.meta.description.trim() === '' ? null : info.meta.description;
@@ -815,7 +825,7 @@
 					<hr class=" border-gray-100/30 dark:border-gray-850/30 my-4" />
 
 					<div class="my-4">
-						<Capabilities bind:capabilities />
+						<Capabilities bind:capabilities {hiddenCapabilities} />
 					</div>
 
 					{#if Object.keys(capabilities).filter((key) => capabilities[key]).length > 0}
