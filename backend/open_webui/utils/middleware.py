@@ -732,6 +732,79 @@ def finalize_output_items(output: list, ended_at: float | None = None) -> list:
     return output
 
 
+RESPONSES_TOOL_EVENT_TYPES = {
+    'web_search_call',
+    'file_search_call',
+    'computer_call',
+    'code_interpreter_call',
+    'image_generation_call',
+}
+
+
+def handle_responses_tool_status_event(
+    data: dict,
+    current_output: list,
+) -> tuple[list, dict | None]:
+    event_type = data.get('type', '')
+    event_parts = event_type.split('.')
+    if len(event_parts) != 3:
+        return current_output, None
+
+    tool_type = event_parts[1]
+    status = event_parts[2]
+    if tool_type not in RESPONSES_TOOL_EVENT_TYPES:
+        return current_output, None
+
+    output_index = data.get('output_index')
+    item_id = data.get('item_id')
+
+    target_index = None
+    if isinstance(output_index, int) and 0 <= output_index < len(current_output):
+        target_index = output_index
+    elif item_id:
+        for idx, item in enumerate(current_output):
+            if isinstance(item, dict) and item.get('id') == item_id:
+                target_index = idx
+                break
+
+    status_map = {
+        'in_progress': 'in_progress',
+        'searching': 'in_progress',
+        'completed': 'completed',
+        'failed': 'failed',
+        'incomplete': 'incomplete',
+    }
+    item_status = status_map.get(status)
+    if item_status is None:
+        return current_output, None
+
+    new_output = list(current_output)
+    incoming_item = data.get('item') if isinstance(data.get('item'), dict) else None
+
+    if target_index is not None:
+        item = new_output[target_index].copy()
+        if incoming_item:
+            item = deep_merge(item, incoming_item)
+        item.setdefault('type', tool_type)
+        if item_id:
+            item.setdefault('id', item_id)
+        item['status'] = item_status
+        new_output[target_index] = item
+    elif item_id:
+        item = {
+            'type': tool_type,
+            'id': item_id,
+            'status': item_status,
+        }
+        if incoming_item:
+            item = deep_merge(item, incoming_item)
+        new_output.append(item)
+    else:
+        return current_output, None
+
+    return new_output, {}
+
+
 def deep_merge(target, source):
     """
     Merge source into target recursively (returning new structure).
@@ -1110,6 +1183,11 @@ def handle_responses_streaming_event(
         # State Machine Event: In Progress
         # We could extract metadata if needed, but for now just acknowledge iteration
         return current_output, None
+
+    elif event_type.startswith('response.') and any(
+        event_type.startswith(f'response.{tool_type}.') for tool_type in RESPONSES_TOOL_EVENT_TYPES
+    ):
+        return handle_responses_tool_status_event(data, current_output)
 
     elif event_type == 'response.failed':
         # State Machine Event: Failed
