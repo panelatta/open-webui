@@ -72,9 +72,13 @@
 		status_updates?: boolean;
 		builtin_tools?: boolean;
 	} = {};
+	export let hiddenCapabilities: string[] = [];
 
 	// Hide file_context when file_upload is disabled
 	$: visibleCapabilities = Object.keys(capabilityLabels).filter((cap) => {
+		if (hiddenCapabilities.includes(cap)) {
+			return false;
+		}
 		if (cap === 'file_context' && !capabilities.file_upload) {
 			return false;
 		}

@@ -57,6 +57,23 @@ from open_webui.config import (
 log = logging.getLogger(__name__)
 
 
+def _get_auto_full_context_max_chars() -> int:
+    try:
+        return max(0, int(os.getenv("AUTO_FULL_CONTEXT_MAX_CHARS", "20000")))
+    except (TypeError, ValueError):
+        return 20000
+
+
+AUTO_FULL_CONTEXT_MAX_CHARS = _get_auto_full_context_max_chars()
+
+
+def _should_auto_use_full_context(content: Optional[str]) -> bool:
+    if AUTO_FULL_CONTEXT_MAX_CHARS <= 0:
+        return False
+
+    return bool(content) and len(content) <= AUTO_FULL_CONTEXT_MAX_CHARS
+
+
 from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun

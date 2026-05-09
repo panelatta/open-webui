@@ -128,6 +128,23 @@ from open_webui.constants import ERROR_MESSAGES
 
 log = logging.getLogger(__name__)
 
+
+def _get_auto_full_context_max_chars() -> int:
+    try:
+        return max(0, int(os.getenv("AUTO_FULL_CONTEXT_MAX_CHARS", "20000")))
+    except (TypeError, ValueError):
+        return 20000
+
+
+AUTO_FULL_CONTEXT_MAX_CHARS = _get_auto_full_context_max_chars()
+
+
+def _should_auto_use_full_context(text_content: Optional[str]) -> bool:
+    if AUTO_FULL_CONTEXT_MAX_CHARS <= 0:
+        return False
+
+    return len(text_content or "") <= AUTO_FULL_CONTEXT_MAX_CHARS
+
 ##########################################
 #
 # Utility functions
@@ -1551,10 +1568,10 @@ async def process_file(
     db: AsyncSession = Depends(get_async_session),
 ):
     """
-    Process a file and save its content to the vector database.
-    Process a file and save its content to the vector database.
-    Note: granular session management is used to prevent connection pool exhaustion.
-    The session is committed before external API calls, and updates use a fresh session.
+    Process a file and store extracted content on the file record.
+
+    Uploaded files intentionally bypass vector indexing and are used as
+    full prompt context instead of RAG chunks.
     """
     if user.role == 'admin':
         file = await Files.get_file_by_id(form_data.file_id, db=db)
@@ -2680,7 +2697,6 @@ async def process_files_batch(
             log.error(f'process_files_batch: Error processing file {file.id}: {str(e)}')
             file_errors.append(BatchProcessFilesResult(file_id=file.id, status='failed', error=str(e)))
 
-    # Save all documents in one batch
     if all_docs:
         try:
             await run_in_threadpool(

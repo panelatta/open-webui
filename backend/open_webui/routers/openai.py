@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -8,6 +9,7 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 from aiocache import cached
+import requests
 
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
@@ -27,6 +29,7 @@ from open_webui.internal.db import get_async_session
 
 from open_webui.models.models import Models
 from open_webui.models.access_grants import AccessGrants
+from open_webui.models.files import Files
 from open_webui.models.groups import Groups
 from open_webui.utils.access_control import has_connection_access, check_model_access
 from open_webui.config import (
@@ -64,6 +67,7 @@ from open_webui.utils.session_pool import (
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import include_user_info_headers, get_custom_headers
 from open_webui.utils.anthropic import is_anthropic_url, get_anthropic_models
+from open_webui.storage.provider import Storage
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +159,95 @@ def openai_reasoning_model_handler(payload):
     return payload
 
 
+def merge_response_tools(
+    existing_tools: Optional[list], configured_tools: Optional[list]
+) -> Optional[list]:
+    if not configured_tools:
+        return existing_tools
+    if not existing_tools:
+        return configured_tools
+
+    merged_tools = []
+    seen = set()
+
+    for tool in [*existing_tools, *configured_tools]:
+        try:
+            marker = json.dumps(tool, sort_keys=True, ensure_ascii=False)
+        except TypeError:
+            marker = str(tool)
+
+        if marker in seen:
+            continue
+
+        seen.add(marker)
+        merged_tools.append(tool)
+
+    return merged_tools
+
+
+def apply_model_params_to_body_responses(params: dict, form_data: dict) -> dict:
+    if not params:
+        return form_data
+
+    payload = apply_model_params_to_body_openai(params.copy(), {})
+    configured_tools = payload.pop("tools", None)
+    configured_tool_choice = payload.pop("tool_choice", None)
+
+    if "max_tokens" in payload:
+        form_data["max_output_tokens"] = payload.pop("max_tokens")
+
+    if "reasoning_effort" in payload:
+        reasoning = form_data.get("reasoning") or {}
+        if not isinstance(reasoning, dict):
+            reasoning = {}
+        reasoning["effort"] = payload.pop("reasoning_effort")
+        form_data["reasoning"] = reasoning
+
+    form_data.update(payload)
+
+    if configured_tools is not None:
+        form_data["tools"] = merge_response_tools(
+            form_data.get("tools"), configured_tools
+        )
+
+    if configured_tool_choice is not None and "tool_choice" not in form_data:
+        form_data["tool_choice"] = configured_tool_choice
+
+    return form_data
+
+
+def summarize_response_debug_value(value):
+    if isinstance(value, str):
+        return {"type": "str", "len": len(value)}
+    if isinstance(value, list):
+        return {"type": "list", "len": len(value)}
+    if isinstance(value, dict):
+        return {
+            key: summarize_response_debug_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def stream_sse_lines(stream: aiohttp.StreamReader):
+    async def yield_sse_lines():
+        buffer = b""
+
+        async for data, _ in stream.iter_chunks():
+            if not data:
+                continue
+
+            buffer += data
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                yield line + b"\n"
+
+        if buffer:
+            yield buffer
+
+    return yield_sse_lines()
+
+
 async def get_headers_and_cookies(
     request: Request,
     url,
@@ -234,6 +327,345 @@ def get_microsoft_entra_id_access_token():
     except Exception as e:
         log.error(f'Error getting Microsoft Entra ID access token: {e}')
         return None
+
+
+def get_openai_api_config_for_index(request: Request, idx: int):
+    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+    key = request.app.state.config.OPENAI_API_KEYS[idx]
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
+        str(idx),
+        request.app.state.config.OPENAI_API_CONFIGS.get(url, {}),
+    )
+    return url, key, api_config
+
+
+def build_openai_file_upload_headers(
+    request: Request,
+    url: str,
+    key: Optional[str],
+    config: Optional[dict] = None,
+    metadata: Optional[dict] = None,
+    user: Optional[UserModel] = None,
+):
+    config = config or {}
+    headers = {
+        **(
+            {
+                "HTTP-Referer": "https://openwebui.com/",
+                "X-Title": "Open WebUI",
+            }
+            if "openrouter.ai" in url
+            else {}
+        ),
+    }
+
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
+        if metadata and metadata.get("chat_id"):
+            headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get("chat_id")
+
+    token = None
+    auth_type = config.get("auth_type")
+
+    if auth_type == "bearer" or auth_type is None:
+        token = key
+    elif auth_type == "none":
+        token = None
+    elif auth_type in ("azure_ad", "microsoft_entra_id"):
+        token = get_microsoft_entra_id_access_token()
+
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    if config.get("headers") and isinstance(config.get("headers"), dict):
+        headers = {**headers, **config.get("headers")}
+
+    headers.pop("Content-Type", None)
+    return headers
+
+
+def _extract_attachment_file_id(file_item: Optional[dict]) -> Optional[str]:
+    if not isinstance(file_item, dict):
+        return None
+
+    nested = file_item.get("file")
+    if isinstance(nested, dict) and nested.get("id"):
+        return nested.get("id")
+
+    file_id = file_item.get("id")
+    if isinstance(file_id, str) and file_id:
+        return file_id
+
+    return None
+
+
+def _extract_attachment_content_type(file_item: Optional[dict]) -> str:
+    if not isinstance(file_item, dict):
+        return ""
+
+    content_type = file_item.get("content_type")
+    if isinstance(content_type, str):
+        return content_type
+
+    nested = file_item.get("file")
+    if isinstance(nested, dict):
+        nested_meta = nested.get("meta") or {}
+        nested_content_type = nested_meta.get("content_type")
+        if isinstance(nested_content_type, str):
+            return nested_content_type
+
+    return ""
+
+
+def _is_image_attachment(file_item: Optional[dict]) -> bool:
+    if not isinstance(file_item, dict):
+        return False
+
+    attachment_type = file_item.get("type")
+    if attachment_type == "image":
+        return True
+
+    return _extract_attachment_content_type(file_item).startswith("image/")
+
+
+async def invalidate_cached_openai_file_ids(attached_files: list[dict]) -> None:
+    for attached_file in attached_files:
+        local_file_id = _extract_attachment_file_id(attached_file)
+        if not local_file_id:
+            continue
+
+        await Files.update_file_data_by_id(
+            local_file_id,
+            {
+                "openai_file_id": None,
+                "openai_backend_index": None,
+                "openai_api_base_url": None,
+                "openai_upload_status": "stale",
+                "openai_file_id_valid_for_next_request": False,
+                "error": None,
+            },
+        )
+
+
+async def mark_openai_file_id_consumed(local_file_id: str) -> None:
+    await Files.update_file_data_by_id(
+        local_file_id,
+        {
+            "openai_file_id_valid_for_next_request": False,
+            "openai_upload_status": "consumed",
+            "error": None,
+        },
+    )
+
+
+def is_unknown_file_id_error(response_payload) -> bool:
+    error_text = ""
+
+    if isinstance(response_payload, dict):
+        error = response_payload.get("error", response_payload)
+        if isinstance(error, dict):
+            error_text = (
+                error.get("message")
+                or error.get("detail")
+                or json.dumps(error, ensure_ascii=False, default=str)
+            )
+        else:
+            error_text = str(error)
+    else:
+        error_text = str(response_payload)
+
+    return "unknown file_id" in error_text.lower()
+
+
+def upload_local_file_to_openai(
+    request: Request,
+    file_item,
+    *,
+    idx: int = 0,
+    metadata: Optional[dict] = None,
+    user: Optional[UserModel] = None,
+) -> str:
+    url, key, api_config = get_openai_api_config_for_index(request, idx)
+    data = file_item.data or {}
+
+    if (
+        data.get("openai_file_id")
+        and data.get("openai_file_id_valid_for_next_request") is True
+        and data.get("openai_backend_index") == idx
+        and data.get("openai_api_base_url") == url
+    ):
+        return data["openai_file_id"]
+
+    if api_config.get("azure", False):
+        raise ValueError("Azure OpenAI file uploads are not supported by this override")
+
+    if not file_item.path:
+        raise ValueError("Local file path is missing")
+
+    file_path = Storage.get_file(file_item.path)
+    headers = build_openai_file_upload_headers(
+        request,
+        url,
+        key,
+        api_config,
+        metadata=metadata,
+        user=user,
+    )
+
+    content_type = ((file_item.meta or {}).get("content_type") or "").strip()
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    with open(file_path, "rb") as fh:
+        response = requests.post(
+            f"{url}/files",
+            data={"purpose": "user_data"},
+            files={"file": (file_item.filename, fh, content_type)},
+            headers=headers,
+            timeout=AIOHTTP_CLIENT_TIMEOUT,
+        )
+
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = response.text
+
+    if response.status_code >= 400:
+        if isinstance(response_payload, dict):
+            error = response_payload.get("error", response_payload)
+        else:
+            error = response_payload
+        raise ValueError(f"Upstream file upload failed: {error}")
+
+    if not isinstance(response_payload, dict) or not response_payload.get("id"):
+        raise ValueError("Upstream file upload returned no file id")
+
+    return response_payload["id"]
+
+
+async def ensure_openai_file_id(
+    request: Request,
+    file_id: str,
+    *,
+    idx: int = 0,
+    metadata: Optional[dict] = None,
+    user: Optional[UserModel] = None,
+) -> Optional[str]:
+    file_item = await Files.get_file_by_id(file_id)
+    if not file_item:
+        return None
+
+    openai_file_id = await asyncio.to_thread(
+        upload_local_file_to_openai,
+        request,
+        file_item,
+        idx=idx,
+        metadata=metadata,
+        user=user,
+    )
+
+    if openai_file_id:
+        await Files.update_file_data_by_id(
+            file_item.id,
+            {
+                "openai_file_id": openai_file_id,
+                "openai_backend_index": idx,
+                "openai_api_base_url": request.app.state.config.OPENAI_API_BASE_URLS[idx],
+                "openai_upload_status": "uploaded",
+                "openai_file_id_valid_for_next_request": True,
+                "openai_uploaded_at": int(time.time()),
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+    return openai_file_id
+
+
+async def inject_openai_files_into_messages(
+    request: Request,
+    payload: dict,
+    metadata: Optional[dict],
+    user: UserModel,
+    *,
+    idx: int,
+) -> dict:
+    attached_files = (metadata or {}).get("files") or payload.pop("files", None) or []
+    if not attached_files:
+        return payload
+
+    messages = payload.get("messages") or []
+    if not messages:
+        return payload
+
+    file_parts = []
+
+    for attached_file in attached_files:
+        if _is_image_attachment(attached_file):
+            continue
+
+        local_file_id = _extract_attachment_file_id(attached_file)
+        if not local_file_id:
+            continue
+
+        try:
+            openai_file_id = await ensure_openai_file_id(
+                request,
+                local_file_id,
+                idx=idx,
+                metadata=metadata,
+                user=user,
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=ERROR_MESSAGES.DEFAULT(str(e)),
+            )
+
+        if openai_file_id:
+            file_parts.append({"type": "input_file", "file_id": openai_file_id})
+            # Treat upstream file ids as single-use for request routing.
+            # This avoids a stale cached file id adding a failed /responses
+            # attempt before we re-upload on the next turn.
+            await mark_openai_file_id_consumed(local_file_id)
+
+    if not file_parts:
+        return payload
+
+    last_user_message = None
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            last_user_message = message
+            break
+
+    if last_user_message is None:
+        messages.append({"role": "user", "content": file_parts})
+        payload["messages"] = messages
+        return payload
+
+    content = last_user_message.get("content", "")
+    if isinstance(content, str):
+        content_parts = [{"type": "text", "text": content}] if content else []
+    elif isinstance(content, list):
+        content_parts = list(content)
+    else:
+        content_parts = [{"type": "text", "text": str(content)}]
+
+    existing_file_ids = {
+        part.get("file_id")
+        or ((part.get("file") or {}).get("file_id") if isinstance(part, dict) else None)
+        for part in content_parts
+        if isinstance(part, dict)
+        and part.get("type") in {"file", "input_file"}
+    }
+    existing_file_ids.discard(None)
+
+    new_file_parts = [
+        part for part in file_parts if part.get("file_id") not in existing_file_ids
+    ]
+    last_user_message["content"] = [*new_file_parts, *content_parts]
+    payload["messages"] = messages
+    return payload
 
 
 ##########################################
@@ -1042,6 +1474,56 @@ def convert_to_responses_payload(payload: dict) -> dict:
     return responses_payload
 
 
+def extract_text_from_response_parts(parts: Optional[list], separator: str = "") -> str:
+    texts = []
+    for part in parts or []:
+        if not isinstance(part, dict):
+            continue
+
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            texts.append(text)
+
+    return separator.join(texts).strip()
+
+
+def extract_chat_compatible_text_from_responses(response: dict) -> tuple[str, str]:
+    output = response.get("output")
+    if not isinstance(output, list):
+        output = []
+
+    assistant_messages = []
+    reasoning_messages = []
+
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "message" and item.get("role") == "assistant":
+            content = extract_text_from_response_parts(item.get("content"))
+            if content:
+                assistant_messages.append(content)
+        elif item_type == "reasoning":
+            summary = extract_text_from_response_parts(
+                item.get("summary"), separator="\n\n"
+            )
+            content = extract_text_from_response_parts(
+                item.get("content"), separator="\n\n"
+            )
+            reasoning_text = summary or content
+            if reasoning_text:
+                reasoning_messages.append(reasoning_text)
+
+    assistant_content = assistant_messages[-1].strip() if assistant_messages else ""
+    reasoning_content = reasoning_messages[-1].strip() if reasoning_messages else ""
+
+    if not assistant_content:
+        assistant_content = response.get("output_text", "") or ""
+
+    return assistant_content, reasoning_content
+
+
 def convert_responses_result(response: dict) -> dict:
     """
     Convert non-streaming Responses API result to Chat Completions format.
@@ -1185,101 +1667,167 @@ async def generate_chat_completion(
 
     headers, cookies = await get_headers_and_cookies(request, url, key, api_config, metadata, user=user)
 
-    is_responses = api_config.get('api_type') == 'responses'
+    is_responses = api_config.get("api_type") == "responses"
+    attached_files = []
+    payload_before_openai_file_injection = None
+    if is_responses:
+        attached_files = (
+            (metadata or {}).get("files") or payload.get("files", None) or []
+        )
+        if attached_files:
+            payload_before_openai_file_injection = copy.deepcopy(payload)
+        payload = await inject_openai_files_into_messages(
+            request,
+            payload,
+            metadata,
+            user,
+            idx=idx,
+        )
 
-    if api_config.get('azure', False):
+    is_azure_v1 = False
+    api_version = None
+    if api_config.get("azure", False):
+        api_version = api_config.get("api_version", "2023-03-15-preview")
+        is_azure_v1 = bool(re.search(r"/openai/v1(?:/|$)", url))
+
         # Only set api-key header if not using Azure Entra ID authentication
-        auth_type = api_config.get('auth_type', 'bearer')
-        if auth_type not in ('azure_ad', 'microsoft_entra_id'):
-            headers['api-key'] = key
+        auth_type = api_config.get("auth_type", "bearer")
+        if auth_type not in ("azure_ad", "microsoft_entra_id"):
+            headers["api-key"] = key
 
-        # Azure v1 format: base URL already ends with /openai/v1,
-        # model stays in the payload, no deployment URL rewriting.
-        is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
+        if not is_azure_v1:
+            headers["api-version"] = api_version
 
-        if is_azure_v1:
-            if is_responses:
-                payload = convert_to_responses_payload(payload)
-                request_url = f'{url.rstrip("/")}/responses'
+    def build_openai_request(base_payload: dict) -> tuple[str, str]:
+        outbound_payload = copy.deepcopy(base_payload)
+
+        if not is_responses and "messages" in outbound_payload:
+            for message in outbound_payload["messages"]:
+                if message.get("role") == "tool" and isinstance(message.get("content"), list):
+                    message["content"] = "".join(
+                        part.get("text", "")
+                        for part in message["content"]
+                        if part.get("type") in ("input_text", "text")
+                    )
+
+        if api_config.get("azure", False):
+            if is_azure_v1:
+                if is_responses:
+                    outbound_payload = convert_to_responses_payload(outbound_payload)
+                    request_url_local = f'{url.rstrip("/")}/responses'
+                else:
+                    request_url_local = f'{url.rstrip("/")}/chat/completions'
             else:
-                request_url = f'{url.rstrip("/")}/chat/completions'
-        else:
-            api_version = api_config.get('api_version', '2023-03-15-preview')
-            request_url, payload = convert_to_azure_payload(url, payload, api_version)
-            headers['api-version'] = api_version
-
-            if is_responses:
-                payload = convert_to_responses_payload(payload)
-                request_url = f'{request_url}/responses?api-version={api_version}'
-            else:
-                request_url = f'{request_url}/chat/completions?api-version={api_version}'
-    else:
-        if is_responses:
-            payload = convert_to_responses_payload(payload)
-            request_url = f'{url}/responses'
-        else:
-            request_url = f'{url}/chat/completions'
-    # For Chat Completions, strip image parts from multimodal tool messages
-    # (Chat Completions doesn't support images in tool content).
-    if not is_responses and 'messages' in payload:
-        for message in payload['messages']:
-            if message.get('role') == 'tool' and isinstance(message.get('content'), list):
-                message['content'] = ''.join(
-                    part.get('text', '') for part in message['content'] if part.get('type') in ('input_text', 'text')
+                request_url_local, outbound_payload = convert_to_azure_payload(
+                    url, outbound_payload, api_version
                 )
 
-    payload = json.dumps(payload)
+                if is_responses:
+                    outbound_payload = convert_to_responses_payload(outbound_payload)
+                    request_url_local = (
+                        f"{request_url_local}/responses?api-version={api_version}"
+                    )
+                else:
+                    request_url_local = (
+                        f"{request_url_local}/chat/completions?api-version={api_version}"
+                    )
+        else:
+            if is_responses:
+                outbound_payload = convert_to_responses_payload(outbound_payload)
+                request_url_local = f"{url}/responses"
+            else:
+                request_url_local = f"{url}/chat/completions"
+
+        return request_url_local, json.dumps(outbound_payload)
+
+    request_url, payload = build_openai_request(payload)
 
     r = None
     streaming = False
     response = None
 
     try:
-        session = await get_session()
+        retry_attempted = False
 
-        r = await session.request(
-            method='POST',
-            url=request_url,
-            data=payload,
-            headers=headers,
-            cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
-        )
+        while True:
+            session = await get_session()
 
-        # Check if response is SSE
-        if 'text/event-stream' in r.headers.get('Content-Type', ''):
-            # If the provider returned an error status with SSE content-type,
-            # read the body and return a proper error response instead of
-            # streaming the error back (which hides the error from logs).
-            if r.status >= 400:
-                error_body = await r.text()
-                log.error(
-                    'Provider returned HTTP %d with SSE content-type: %s',
-                    r.status,
-                    error_body[:1000],
-                )
-                try:
-                    error_json = json.loads(error_body)
-                    return JSONResponse(status_code=r.status, content=error_json)
-                except json.JSONDecodeError:
-                    return JSONResponse(
-                        status_code=r.status,
-                        content={'error': {'message': error_body, 'code': r.status}},
-                    )
-
-            streaming = True
-            return StreamingResponse(
-                stream_wrapper(r, content_handler=stream_chunks_handler),
-                status_code=r.status,
-                headers=_clean_proxy_headers(r.headers),
+            r = await session.request(
+                method="POST",
+                url=request_url,
+                data=payload,
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
             )
-        else:
+
+            # Check if response is SSE
+            if "text/event-stream" in r.headers.get("Content-Type", ""):
+                # If the provider returned an error status with SSE content-type,
+                # read the body and return a proper error response instead of
+                # streaming the error back (which hides the error from logs).
+                if r.status >= 400:
+                    error_body = await r.text()
+                    log.error(
+                        "Provider returned HTTP %d with SSE content-type: %s",
+                        r.status,
+                        error_body[:1000],
+                    )
+                    try:
+                        error_json = json.loads(error_body)
+                        return JSONResponse(status_code=r.status, content=error_json)
+                    except json.JSONDecodeError:
+                        return JSONResponse(
+                            status_code=r.status,
+                            content={
+                                "error": {
+                                    "message": error_body,
+                                    "code": r.status,
+                                }
+                            },
+                        )
+
+                streaming = True
+                content_handler = stream_sse_lines if is_responses else stream_chunks_handler
+                return StreamingResponse(
+                    stream_wrapper(r, content_handler=content_handler),
+                    status_code=r.status,
+                    headers=_clean_proxy_headers(r.headers),
+                )
+
             try:
                 response = await r.json()
             except Exception as e:
                 log.error(e)
                 response = await r.text()
+
+            if (
+                r.status >= 400
+                and is_responses
+                and attached_files
+                and payload_before_openai_file_injection is not None
+                and not retry_attempted
+                and is_unknown_file_id_error(response)
+            ):
+                log.info(
+                    "Retrying /responses request after stale upstream file id for chat_id=%s",
+                    (metadata or {}).get("chat_id"),
+                )
+                retry_attempted = True
+                await cleanup_response(r)
+                r = None
+
+                await invalidate_cached_openai_file_ids(attached_files)
+                refreshed_payload = await inject_openai_files_into_messages(
+                    request,
+                    copy.deepcopy(payload_before_openai_file_injection),
+                    metadata,
+                    user,
+                    idx=idx,
+                )
+                request_url, payload = build_openai_request(refreshed_payload)
+                continue
 
             if r.status >= 400:
                 if isinstance(response, (dict, list)):
@@ -1406,12 +1954,16 @@ class ResponsesForm(BaseModel):
 @router.post('/responses')
 async def responses(
     request: Request,
-    form_data: ResponsesForm,
+    form_data: dict,
     user=Depends(get_verified_user),
 ):
     """
     Forward requests to the OpenAI Responses API endpoint.
     Routes to the correct upstream backend based on the model field.
+
+    If the caller still sends Chat Completions-shaped payloads, reuse the
+    existing chat route so the browser can switch to /responses without
+    breaking the current frontend request shape.
     """
     payload = form_data.model_dump(exclude_none=True)
 
@@ -1487,6 +2039,21 @@ async def responses(
                 response_data = await r.text()
 
             if r.status >= 400:
+                log.info(
+                    "responses_debug error %s",
+                    json.dumps(
+                        {
+                            **debug_info,
+                            "status": r.status,
+                            "request_url": request_url,
+                            "error_response": summarize_response_debug_value(
+                                response_data
+                            ),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                )
                 if isinstance(response_data, (dict, list)):
                     return JSONResponse(status_code=r.status, content=response_data)
                 else:
