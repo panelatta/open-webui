@@ -556,23 +556,27 @@ def serialize_output(output: list) -> str:
             parts.append(_render_openai_tool_call_handler(item, done).rstrip('\n'))
 
         elif item_type == 'reasoning':
-            reasoning_parts: list[str] = []
-            # Check for 'summary' (new structure) or 'content' (legacy/fallback)
-            source_list = item.get('summary', []) or item.get('content', [])
-            for content_part in source_list:
-                if 'text' in content_part:
-                    reasoning_parts.append(content_part.get('text', ''))
-                elif 'summary' in content_part:  # Handle potential nested logic if any
-                    pass
+            def collect_reasoning_text(parts: list) -> str:
+                reasoning_parts = []
+                for content_part in parts or []:
+                    text = content_part.get('text', '')
+                    if text and text.strip():
+                        reasoning_parts.append(text.strip())
+                return '\n\n'.join(reasoning_parts).strip()
 
-            reasoning_content = ''.join(reasoning_parts).strip()
+            summary_reasoning = collect_reasoning_text(item.get('summary', []))
+            body_reasoning = collect_reasoning_text(item.get('content', []))
+            reasoning_content = summary_reasoning or body_reasoning
+            has_visible_reasoning = bool(reasoning_content)
 
             duration = item.get('duration')
             status = item.get('status', 'in_progress')
 
             is_last_item = idx == len(output) - 1
-            should_render_completed = has_visible_reasoning and status == "completed"
-            should_render_placeholder = status != "completed"
+            should_render_completed = has_visible_reasoning and (
+                status == 'completed' or duration is not None or not is_last_item
+            )
+            should_render_placeholder = status != 'completed'
 
             if not should_render_completed and not should_render_placeholder:
                 continue
@@ -583,9 +587,14 @@ def serialize_output(output: list) -> str:
                 )
             )
 
-            if status == 'completed' or duration is not None or not is_last_item:
+            if should_render_completed:
+                summary_text = (
+                    'Thought for less than a second'
+                    if duration is not None and duration < 1
+                    else f'Thought for {duration or 0} seconds'
+                )
                 parts.append(
-                    f'<details type="reasoning" done="true" duration="{duration or 0}">\n<summary>Thought for {duration or 0} seconds</summary>\n{display}\n</details>'
+                    f'<details type="reasoning" done="true" duration="{duration or 0}">\n<summary>{summary_text}</summary>\n{display}\n</details>'
                 )
             else:
                 parts.append(
