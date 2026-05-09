@@ -796,6 +796,7 @@ def handle_responses_streaming_event(
 
     if event_type == 'response.output_item.added':
         item = data.get('item', {})
+        output_index = data.get('output_index', len(current_output))
         if item:
             new_output = list(current_output)
             if (
