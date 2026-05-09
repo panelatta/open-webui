@@ -408,6 +408,31 @@ _OPENAI_TOOL_DISPLAY_NAMES = {
 }
 
 
+def _format_openai_web_search_sources(sources: list) -> str:
+    lines = []
+
+    for idx, source in enumerate(sources, start=1):
+        if isinstance(source, dict):
+            url = source.get('url') or source.get('source') or ''
+            title = (
+                source.get('title')
+                or source.get('name')
+                or source.get('type')
+                or url
+                or f'Source {idx}'
+            )
+
+            if url:
+                lines.append(f'{idx}. {title}\n   {url}')
+            else:
+                details = json.dumps(source, ensure_ascii=False)
+                lines.append(f'{idx}. {title}\n   {details}')
+        else:
+            lines.append(f'{idx}. {source}')
+
+    return '\n'.join(lines)
+
+
 def _render_openai_tool_call_handler(item: dict, done: bool) -> str:
     """Render an OpenAI Responses API server-side tool item as a <details> block.
 
@@ -420,9 +445,14 @@ def _render_openai_tool_call_handler(item: dict, done: bool) -> str:
 
     # Build a short summary of what the tool did
     summary = ''
+    arguments = ''
     if item_type == 'web_search_call':
         action = item.get('action', {})
         if isinstance(action, dict):
+            arguments = json.dumps(
+                {k: v for k, v in action.items() if k != 'sources'},
+                ensure_ascii=False,
+            )
             atype = action.get('type', '')
             if atype == 'search':
                 queries = action.get('queries') or []
@@ -436,22 +466,36 @@ def _render_openai_tool_call_handler(item: dict, done: bool) -> str:
                 summary = f'Open page: {action.get("url", "")}' if action.get('url') else ''
             elif atype == 'find_in_page':
                 summary = f'Find in page: {action.get("pattern", "")}' if action.get('pattern') else ''
+
+            sources = action.get('sources') or []
+            if isinstance(sources, list) and sources:
+                sources_summary = _format_openai_web_search_sources(sources)
+                summary = (
+                    f'{summary}\n\nSources:\n{sources_summary}'
+                    if summary
+                    else f'Sources:\n{sources_summary}'
+                )
     elif item_type == 'file_search_call':
         queries = item.get('queries', [])
+        if queries:
+            arguments = json.dumps({'queries': queries}, ensure_ascii=False)
         if queries:
             summary = f'Queries: {", ".join(str(q) for q in queries)}'
     elif item_type == 'computer_call':
         action = item.get('action')
         actions = item.get('actions')
         if isinstance(action, dict):
+            arguments = json.dumps(action, ensure_ascii=False)
             summary = f'Action: {action.get("type", "unknown")}'
         elif isinstance(actions, list) and actions:
+            arguments = json.dumps({'actions': actions}, ensure_ascii=False)
             summary = f'Actions: {", ".join(a.get("type", "?") for a in actions if isinstance(a, dict))}'
 
     escaped_name = html.escape(display_name)
+    escaped_arguments = html.escape(arguments)
     if done:
-        return f'<details type="tool_calls" done="true" id="{call_id}" name="{escaped_name}" arguments="">\n<summary>Tool Executed</summary>\n{html.escape(summary)}\n</details>\n'
-    return f'<details type="tool_calls" done="false" id="{call_id}" name="{escaped_name}" arguments="">\n<summary>Executing...</summary>\n</details>\n'
+        return f'<details type="tool_calls" done="true" id="{call_id}" name="{escaped_name}" arguments="{escaped_arguments}">\n<summary>Tool Executed</summary>\n{html.escape(summary)}\n</details>\n'
+    return f'<details type="tool_calls" done="false" id="{call_id}" name="{escaped_name}" arguments="{escaped_arguments}">\n<summary>Executing...</summary>\n</details>\n'
 
 
 def serialize_output(output: list) -> str:
@@ -526,9 +570,12 @@ def serialize_output(output: list) -> str:
             duration = item.get('duration')
             status = item.get('status', 'in_progress')
 
-            # Infer completion: if this reasoning item is NOT the last item,
-            # render as done (a subsequent item means reasoning is complete)
             is_last_item = idx == len(output) - 1
+            should_render_completed = has_visible_reasoning and status == "completed"
+            should_render_placeholder = status != "completed"
+
+            if not should_render_completed and not should_render_placeholder:
+                continue
 
             display = html.escape(
                 '\n'.join(
@@ -593,6 +640,88 @@ def serialize_output(output: list) -> str:
     return '\n'.join(parts).strip()
 
 
+def normalize_responses_output_item(item: dict, previous_item: dict | None = None) -> dict:
+    normalized_item = copy.deepcopy(item)
+
+    if normalized_item.get("type") != "reasoning":
+        return normalized_item
+
+    normalized_item.pop("encrypted_content", None)
+    normalized_item.setdefault("status", "in_progress")
+
+    started_at = None
+    if previous_item and isinstance(previous_item, dict):
+        started_at = previous_item.get("started_at")
+        if started_at is not None:
+            normalized_item.setdefault("started_at", started_at)
+
+        if previous_item.get("summary") and not normalized_item.get("summary"):
+            normalized_item["summary"] = copy.deepcopy(previous_item["summary"])
+
+        if previous_item.get("content") and not normalized_item.get("content"):
+            normalized_item["content"] = copy.deepcopy(previous_item["content"])
+
+    normalized_item.setdefault("started_at", time.time())
+    return keep_reasoning_item_in_progress(normalized_item)
+
+
+def is_transient_reasoning_placeholder(item: dict | None) -> bool:
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "reasoning"
+        and item.get("_placeholder") is True
+    )
+
+
+def build_responses_reasoning_placeholder() -> dict:
+    return {
+        "type": "reasoning",
+        "id": output_id("rs"),
+        "status": "in_progress",
+        "summary": [],
+        "content": [],
+        "started_at": time.time(),
+        "_placeholder": True,
+    }
+
+
+def keep_reasoning_item_in_progress(item: dict) -> dict:
+    if not isinstance(item, dict) or item.get("type") != "reasoning":
+        return item
+
+    item.pop("encrypted_content", None)
+    item["status"] = "in_progress"
+    item.pop("ended_at", None)
+    item.pop("duration", None)
+    return item
+
+
+def finalize_output_items(output: list, ended_at: float | None = None) -> list:
+    completed_at = ended_at or time.time()
+
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+
+        item.pop("_placeholder", None)
+
+        if item.get("type") == "reasoning":
+            item.pop("encrypted_content", None)
+            item["status"] = "completed"
+
+            started_at = item.get("started_at")
+            item["ended_at"] = item.get("ended_at", completed_at)
+            item["duration"] = (
+                max(0, int(item["ended_at"] - started_at))
+                if started_at is not None
+                else 0
+            )
+        elif item.get("status") == "in_progress":
+            item["status"] = "completed"
+
+    return output
+
+
 def deep_merge(target, source):
     """
     Merge source into target recursively (returning new structure).
@@ -612,6 +741,26 @@ def deep_merge(target, source):
         return target + source
     else:
         return source
+
+
+def extract_first_json_object(text: str) -> Optional[dict]:
+    if not isinstance(text, str):
+        return None
+
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+
+        try:
+            value, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(value, dict):
+            return value
+
+    return None
 
 
 def handle_responses_streaming_event(
@@ -640,7 +789,16 @@ def handle_responses_streaming_event(
         item = data.get('item', {})
         if item:
             new_output = list(current_output)
-            new_output.append(item)
+            if (
+                isinstance(output_index, int)
+                and 0 <= output_index < len(current_output)
+                and is_transient_reasoning_placeholder(current_output[output_index])
+            ):
+                new_output[output_index] = normalize_responses_output_item(
+                    item, current_output[output_index]
+                )
+            else:
+                new_output.append(normalize_responses_output_item(item))
             return new_output, None
         return current_output, None
 
@@ -905,9 +1063,17 @@ def handle_responses_streaming_event(
 
         new_output = list(current_output)
         if item and 0 <= output_index < len(current_output):
-            new_output[output_index] = item
+            normalized_item = normalize_responses_output_item(
+                item, current_output[output_index]
+            )
+            if normalized_item.get("type") == "reasoning":
+                normalized_item = keep_reasoning_item_in_progress(normalized_item)
+            new_output[output_index] = normalized_item
         elif item:
-            new_output.append(item)
+            normalized_item = normalize_responses_output_item(item)
+            if normalized_item.get("type") == "reasoning":
+                normalized_item = keep_reasoning_item_in_progress(normalized_item)
+            new_output.append(normalized_item)
         return new_output, {}
 
     elif event_type == 'response.completed':
@@ -2874,10 +3040,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 except Exception as e:
                     log.exception(e)
 
-    # Check if file context extraction is enabled for this model (default True)
+    # Check if file context extraction is enabled for this model (default True).
+    # OpenAI-backed models must not use Open WebUI's local RAG/file-context path:
+    # file attachments are handled later by the OpenAI router via direct message
+    # context or official Responses file uploads.
     file_context_enabled = (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get('file_context', True)
+    local_file_context_allowed = file_context_enabled and model.get('owned_by') != 'openai'
 
-    if file_context_enabled:
+    if local_file_context_allowed:
         try:
             form_data, flags = await chat_completion_files_handler(request, form_data, extra_params, user)
             sources.extend(flags.get('sources', []))
@@ -3860,6 +4030,22 @@ async def streaming_chat_response_handler(response, ctx):
                         },
                     )
 
+                if (
+                    not output
+                    and model_id.lower().startswith("gpt-5")
+                    and not metadata.get("reasoning_placeholder_emitted")
+                ):
+                    output = [build_responses_reasoning_placeholder()]
+                    await event_emitter(
+                        {
+                            "type": "chat:completion",
+                            "data": {
+                                "content": serialize_output(output),
+                                "output": output,
+                            },
+                        }
+                    )
+
                 async def stream_body_handler(response, form_data):
                     nonlocal content
                     nonlocal usage
@@ -3977,6 +4163,13 @@ async def streaming_chat_response_handler(response, ctx):
                                         'output': full_output(),
                                         'content': serialize_output(full_output()),
                                     }
+
+                                    if data.get("type") in {
+                                        "response.output_item.done",
+                                        "response.completed",
+                                        "response.failed",
+                                    }:
+                                        processed_data["output"] = output
 
                                     # print(data)
                                     # print(processed_data)
@@ -4557,6 +4750,10 @@ async def streaming_chat_response_handler(response, ctx):
                                 }
 
                                 if direct_tool:
+                                    if not event_caller:
+                                        raise RuntimeError(
+                                            "Direct tool execution requires an active websocket session."
+                                        )
                                     tool_result = await event_caller(
                                         {
                                             'type': 'execute:tool',

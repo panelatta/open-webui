@@ -1,11 +1,13 @@
 import logging
 import os
+import time
 import uuid
 import json
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 import asyncio
+import requests
 
 from fastapi import (
     BackgroundTasks,
@@ -50,6 +52,7 @@ from open_webui.storage.provider import Storage
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STORAGE_LOCAL_CACHE, STORAGE_PROVIDER, UPLOAD_DIR
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.misc import strict_match_mime_type
 from pydantic import BaseModel
 
@@ -317,6 +320,12 @@ async def upload_file_handler(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=ERROR_MESSAGES.DEFAULT('Error uploading file'),
                 )
+            return {"status": True, **file_item.model_dump()}
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
+        )
 
     except HTTPException as e:
         raise e

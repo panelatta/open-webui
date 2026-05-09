@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 import logging
 import asyncio
+import os
 from typing import Optional
 
 from open_webui.models.memories import Memories, MemoryModel
@@ -16,6 +17,44 @@ from open_webui.constants import ERROR_MESSAGES
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+DEFAULT_QWEN3_MEMORY_QUERY_PROMPT = (
+    'Instruct: Given a user message, retrieve relevant user memory entries.\n'
+    'Query: '
+)
+
+
+def get_memory_query_embedding_prompt(request: Request) -> Optional[str]:
+    prompt = os.getenv('MEMORY_QUERY_EMBEDDING_PROMPT')
+    if prompt is not None:
+        return prompt or None
+
+    embedding_model = getattr(request.app.state.config, 'RAG_EMBEDDING_MODEL', '')
+    if 'Qwen3-Embedding' in embedding_model:
+        return DEFAULT_QWEN3_MEMORY_QUERY_PROMPT
+
+    return None
+
+
+def get_memory_content_embedding_prompt() -> Optional[str]:
+    return os.getenv('MEMORY_CONTENT_EMBEDDING_PROMPT') or None
+
+
+async def embed_memory_content(request: Request, content: str, user) -> list[float]:
+    return await request.app.state.EMBEDDING_FUNCTION(
+        content,
+        prefix=get_memory_content_embedding_prompt(),
+        user=user,
+    )
+
+
+async def embed_memory_query(request: Request, content: str, user) -> list[float]:
+    return await request.app.state.EMBEDDING_FUNCTION(
+        content,
+        prefix=get_memory_query_embedding_prompt(request),
+        user=user,
+    )
 
 
 ############################
@@ -83,7 +122,7 @@ async def add_memory(
 
     memory = await Memories.insert_new_memory(user.id, form_data.content)
 
-    vector = await request.app.state.EMBEDDING_FUNCTION(memory.content, user=user)
+    vector = await embed_memory_content(request, memory.content, user)
 
     await ASYNC_VECTOR_DB_CLIENT.upsert(
         collection_name=f'user-memory-{user.id}',
@@ -136,7 +175,7 @@ async def query_memory(
     if not memories:
         raise HTTPException(status_code=404, detail='No memories found for user')
 
-    vector = await request.app.state.EMBEDDING_FUNCTION(form_data.content, user=user)
+    vector = await embed_memory_query(request, form_data.content, user)
 
     results = await ASYNC_VECTOR_DB_CLIENT.search(
         collection_name=f'user-memory-{user.id}',
@@ -213,7 +252,7 @@ async def reset_memory_from_vector_db(
 
     # Generate vectors in parallel
     vectors = await asyncio.gather(
-        *[request.app.state.EMBEDDING_FUNCTION(memory.content, user=user) for memory in memories]
+        *[embed_memory_content(request, memory.content, user) for memory in memories]
     )
 
     await ASYNC_VECTOR_DB_CLIENT.upsert(
@@ -303,7 +342,7 @@ async def update_memory_by_id(
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
 
     if form_data.content is not None:
-        vector = await request.app.state.EMBEDDING_FUNCTION(memory.content, user=user)
+        vector = await embed_memory_content(request, memory.content, user)
 
         await ASYNC_VECTOR_DB_CLIENT.upsert(
             collection_name=f'user-memory-{user.id}',

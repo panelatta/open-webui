@@ -228,7 +228,6 @@ async def create_new_model(
             form_data.access_grants,
             'sharing.public_models',
         )
-
         model = await Models.insert_new_model(form_data, user.id, db=db)
         if model:
             return model
@@ -608,7 +607,6 @@ async def update_model_by_id(
         form_data.access_grants,
         'sharing.public_models',
     )
-
     model = await Models.update_model_by_id(form_data.id, ModelForm(**form_data.model_dump()), db=db)
     return model
 

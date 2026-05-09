@@ -98,6 +98,7 @@
 	let defaultFilterIds = [];
 
 	let capabilities = { ...DEFAULT_CAPABILITIES };
+	let hiddenCapabilities = [];
 	let defaultFeatureIds = [];
 	let builtinTools = {};
 
@@ -815,7 +816,7 @@
 					<hr class=" border-gray-100/30 dark:border-gray-850/30 my-4" />
 
 					<div class="my-4">
-						<Capabilities bind:capabilities />
+						<Capabilities bind:capabilities {hiddenCapabilities} />
 					</div>
 
 					{#if Object.keys(capabilities).filter((key) => capabilities[key]).length > 0}

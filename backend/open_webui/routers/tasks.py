@@ -23,6 +23,7 @@ from open_webui.constants import ERROR_MESSAGES, TASKS
 from open_webui.routers.pipelines import process_pipeline_inlet_filter
 
 from open_webui.utils.task import get_task_model_id
+from open_webui.utils.models import get_all_models
 
 from open_webui.config import (
     DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE,
@@ -170,6 +171,10 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
         models = request.app.state.MODELS
 
     model_id = form_data['model']
+    if not models or model_id not in models:
+        await get_all_models(request, user=user)
+        models = request.app.state.MODELS
+
     if model_id not in models:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -248,6 +253,10 @@ async def generate_follow_ups(request: Request, form_data: dict, user=Depends(ge
         models = request.app.state.MODELS
 
     model_id = form_data['model']
+    if not models or model_id not in models:
+        await get_all_models(request, user=user)
+        models = request.app.state.MODELS
+
     if model_id not in models:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -317,6 +326,10 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
         models = request.app.state.MODELS
 
     model_id = form_data['model']
+    if not models or model_id not in models:
+        await get_all_models(request, user=user)
+        models = request.app.state.MODELS
+
     if model_id not in models:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
