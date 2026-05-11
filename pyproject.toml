@@ -206,6 +206,16 @@ exclude = [
 ]
 force-include = { "CHANGELOG.md" = "open_webui/CHANGELOG.md", build = "open_webui/frontend" }
 
+[tool.pytest.ini_options]
+pythonpath = [
+    "backend",
+    "backend/open_webui",
+]
+testpaths = [
+    "backend/open_webui/test",
+]
+asyncio_mode = "auto"
+
 [tool.codespell]
 # Ref: https://github.com/codespell-project/codespell#using-a-config-file
 skip = '.git*,*.svg,package-lock.json,i18n,*.lock,*.css,*-bundle.js,locales,example-doc.txt,emoji-shortcodes.json'

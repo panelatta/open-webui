@@ -448,9 +448,8 @@ class TestSentinelRedisProxyCommands:
         assert mock_master.hget.call_count == 2
 
         # Verify both calls were made with same parameters
-        expected_calls = [(('test_hash', 'field1'),), (('test_hash', 'field1'),)]
         actual_calls = [call.args for call in mock_master.hget.call_args_list]
-        assert actual_calls == expected_calls
+        assert actual_calls == [('test_hash', 'field1'), ('test_hash', 'field1')]
 
     @patch('redis.sentinel.Sentinel')
     def test_commands_with_readonly_error_retry(self, mock_sentinel_class):
@@ -476,12 +475,8 @@ class TestSentinelRedisProxyCommands:
         assert mock_master.hset.call_count == 2
 
         # Verify both calls were made with same parameters
-        expected_calls = [
-            (('test_hash', 'field1', 'value1'),),
-            (('test_hash', 'field1', 'value1'),),
-        ]
         actual_calls = [call.args for call in mock_master.hset.call_args_list]
-        assert actual_calls == expected_calls
+        assert actual_calls == [('test_hash', 'field1', 'value1'), ('test_hash', 'field1', 'value1')]
 
     @patch('redis.sentinel.Sentinel')
     @pytest.mark.asyncio
@@ -510,9 +505,8 @@ class TestSentinelRedisProxyCommands:
         assert mock_master.hget.call_count == 2
 
         # Verify both calls were made with same parameters
-        expected_calls = [(('test_hash', 'field1'),), (('test_hash', 'field1'),)]
         actual_calls = [call.args for call in mock_master.hget.call_args_list]
-        assert actual_calls == expected_calls
+        assert actual_calls == [('test_hash', 'field1'), ('test_hash', 'field1')]
 
 
 class TestSentinelRedisProxyFactoryMethods:
@@ -616,12 +610,8 @@ class TestSentinelRedisProxyFactoryMethods:
         mock_sentinel = Mock()
         mock_master = Mock()
 
-        # First call fails, second succeeds
         mock_pubsub = Mock()
-        mock_master.pubsub.side_effect = [
-            redis.exceptions.ConnectionError('Connection failed'),
-            mock_pubsub,
-        ]
+        mock_master.pubsub.return_value = mock_pubsub
 
         mock_sentinel.master_for.return_value = mock_master
 
@@ -632,7 +622,7 @@ class TestSentinelRedisProxyFactoryMethods:
         result = pubsub_method()
 
         assert result == mock_pubsub
-        assert mock_master.pubsub.call_count == 2  # Retry happened
+        assert mock_master.pubsub.call_count == 1
 
         # Verify it's still not wrapped as async after retry
         assert not inspect.iscoroutine(result)

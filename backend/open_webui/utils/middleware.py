@@ -7,6 +7,7 @@ import base64
 import textwrap
 
 import asyncio
+import aiohttp
 from aiocache import cached
 from typing import Any, Optional
 import random
@@ -131,6 +132,9 @@ from open_webui.env import (
     ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION,
     CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE,
     CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES,
+    CHAT_RESPONSE_STREAM_RETRY_ATTEMPTS,
+    CHAT_RESPONSE_STREAM_RETRY_DELAY,
+    CHAT_RESPONSE_STREAM_RETRY_VISIBLE_CHAR_LIMIT,
     BYPASS_MODEL_ACCESS_CONTROL,
     ENABLE_REALTIME_CHAT_SAVE,
     ENABLE_QUERIES_CACHE,
@@ -407,6 +411,73 @@ _OPENAI_TOOL_DISPLAY_NAMES = {
     'file_search_call': 'File Search',
     'computer_call': 'Computer Use',
 }
+
+
+class RetryableStreamError(Exception):
+    def __init__(self, error: Any):
+        self.error = error
+        super().__init__(str(error))
+
+
+def _is_retryable_stream_error(error: Any) -> bool:
+    if isinstance(error, dict):
+        code = str(error.get('code', '')).lower()
+        message = str(error.get('message', '')).lower()
+        error_type = str(error.get('type', '')).lower()
+
+        if code == 'stream_read_error' or message == 'stream_read_error':
+            return True
+
+        if error_type == 'upstream_error' and (
+            'stream' in code or 'stream' in message or 'read' in code or 'read' in message
+        ):
+            return True
+
+        return False
+
+    return 'stream_read_error' in str(error).lower()
+
+
+def _count_stream_retry_visible_chars(output: list) -> int:
+    total = 0
+
+    for item in output or []:
+        if not isinstance(item, dict):
+            continue
+
+        content = item.get('content')
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get('text')
+                    if isinstance(text, str):
+                        total += len(text)
+
+        for field in ('code', 'output', 'result', 'text'):
+            value = item.get(field)
+            if isinstance(value, str):
+                total += len(value)
+
+    return total
+
+
+def _stream_retryable(output: list) -> bool:
+    if _count_stream_retry_visible_chars(output) > CHAT_RESPONSE_STREAM_RETRY_VISIBLE_CHAR_LIMIT:
+        return False
+
+    blocked_item_types = {
+        'open_webui:code_interpreter',
+        'computer_call',
+        'function_call_output',
+    }
+
+    for item in output or []:
+        if isinstance(item, dict) and item.get('type') in blocked_item_types:
+            return False
+
+    return True
 
 
 def _format_openai_web_search_sources(sources: list) -> str:
@@ -4106,6 +4177,108 @@ async def streaming_chat_response_handler(response, ctx):
             def full_output():
                 return prior_output + output if prior_output else output
 
+            stream_response_backgrounds_completed = set()
+
+            async def cleanup_stream_response(stream_response):
+                if (
+                    stream_response
+                    and stream_response.background
+                    and id(stream_response) not in stream_response_backgrounds_completed
+                ):
+                    stream_response_backgrounds_completed.add(id(stream_response))
+                    await stream_response.background()
+
+            async def record_stream_error(error):
+                log.error('Provider returned error (streaming): %s', error)
+                try:
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
+                        metadata['chat_id'],
+                        metadata['message_id'],
+                        {
+                            'error': {'content': error},
+                        },
+                    )
+                except Exception:
+                    pass
+
+                await event_emitter(
+                    {
+                        'type': 'chat:completion',
+                        'data': {
+                            'error': error,
+                        },
+                    }
+                )
+
+            async def reset_current_stream_for_retry(error, attempt, max_attempts):
+                nonlocal content
+                nonlocal usage
+                nonlocal output
+                nonlocal last_response_id
+
+                content = ''
+                usage = None
+                output = []
+                last_response_id = None
+                tool_calls.clear()
+
+                reset_output = full_output()
+                reset_content = serialize_output(reset_output)
+
+                log.warning(
+                    'Retrying streaming response after retryable upstream error '
+                    '(attempt %s/%s, chat_id=%s, message_id=%s): %s',
+                    attempt,
+                    max_attempts,
+                    metadata.get('chat_id'),
+                    metadata.get('message_id'),
+                    error,
+                )
+
+                await event_emitter(
+                    {
+                        'type': 'status',
+                        'data': {
+                            'action': 'stream_retry',
+                            'description': f'Upstream stream interrupted; retrying ({attempt}/{max_attempts})',
+                            'done': False,
+                            'hidden': True,
+                        },
+                    }
+                )
+
+                if metadata.get('chat_id') and not metadata['chat_id'].startswith('channel:'):
+                    try:
+                        await Chats.upsert_message_to_chat_by_id_and_message_id(
+                            metadata['chat_id'],
+                            metadata['message_id'],
+                            {
+                                'content': reset_content,
+                                'output': reset_output,
+                                'error': None,
+                            },
+                        )
+                    except Exception:
+                        pass
+
+                await event_emitter(
+                    {
+                        'type': 'chat:message',
+                        'data': {
+                            'content': reset_content,
+                        },
+                    }
+                )
+                await event_emitter(
+                    {
+                        'type': 'chat:completion',
+                        'data': {
+                            'content': reset_content,
+                            'output': reset_output,
+                        },
+                    }
+                )
+
             reasoning_tags_param = metadata.get('params', {}).get('reasoning_tags')
             DETECT_REASONING_TAGS = reasoning_tags_param is not False
             DETECT_CODE_INTERPRETER = metadata.get('features', {}).get('code_interpreter', False)
@@ -4285,6 +4458,10 @@ async def streaming_chat_response_handler(response, ctx):
                                     # calls. The outer middleware manages the
                                     # actual completion signal.
                                     if response_metadata:
+                                        retryable_error = response_metadata.get('error')
+                                        if retryable_error and _is_retryable_stream_error(retryable_error):
+                                            raise RetryableStreamError(retryable_error)
+
                                         if ENABLE_RESPONSES_API_STATEFUL:
                                             response_id = response_metadata.pop('response_id', None)
                                             if response_id:
@@ -4325,25 +4502,10 @@ async def streaming_chat_response_handler(response, ctx):
                                     if not choices:
                                         error = data.get('error', {})
                                         if error:
-                                            log.error('Provider returned error (streaming): %s', error)
-                                            try:
-                                                await Chats.upsert_message_to_chat_by_id_and_message_id(
-                                                    metadata['chat_id'],
-                                                    metadata['message_id'],
-                                                    {
-                                                        'error': {'content': error},
-                                                    },
-                                                )
-                                            except Exception:
-                                                pass
-                                            await event_emitter(
-                                                {
-                                                    'type': 'chat:completion',
-                                                    'data': {
-                                                        'error': error,
-                                                    },
-                                                }
-                                            )
+                                            if _is_retryable_stream_error(error):
+                                                raise RetryableStreamError(error)
+
+                                            await record_stream_error(error)
                                         continue
 
                                     delta = choices[0].get('delta', {})
@@ -4670,6 +4832,8 @@ async def streaming_chat_response_handler(response, ctx):
                                             'data': data,
                                         }
                                     )
+                        except RetryableStreamError:
+                            raise
                         except (asyncio.CancelledError, KeyboardInterrupt):
                             raise
                         except Exception as e:
@@ -4743,11 +4907,62 @@ async def streaming_chat_response_handler(response, ctx):
                         if responses_api_tool_calls:
                             tool_calls.append(_split_tool_calls(responses_api_tool_calls))
 
-                try:
-                    await stream_body_handler(response, form_data)
-                finally:
-                    if response.background:
-                        await response.background()
+                async def stream_with_retries(current_response, current_form_data):
+                    base_form_data = copy.deepcopy(current_form_data)
+                    retry_attempts = max(0, CHAT_RESPONSE_STREAM_RETRY_ATTEMPTS)
+                    attempt = 0
+
+                    while True:
+                        retry_error = None
+
+                        try:
+                            await stream_body_handler(current_response, current_form_data)
+                            return
+                        except RetryableStreamError as e:
+                            retry_error = e.error
+                        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                            retry_error = {
+                                'code': e.__class__.__name__,
+                                'message': str(e),
+                                'type': 'transport_error',
+                            }
+                        finally:
+                            await cleanup_stream_response(current_response)
+
+                        if attempt >= retry_attempts or not _stream_retryable(output):
+                            await record_stream_error(retry_error)
+                            return
+
+                        attempt += 1
+                        await reset_current_stream_for_retry(retry_error, attempt, retry_attempts)
+
+                        if CHAT_RESPONSE_STREAM_RETRY_DELAY > 0:
+                            await asyncio.sleep(CHAT_RESPONSE_STREAM_RETRY_DELAY)
+
+                        retry_form_data = copy.deepcopy(base_form_data)
+                        retry_form_data['stream'] = True
+                        retry_form_data['metadata'] = metadata
+
+                        retry_response = await generate_chat_completion(
+                            request,
+                            retry_form_data,
+                            user,
+                        )
+
+                        if not isinstance(retry_response, StreamingResponse):
+                            await record_stream_error(
+                                {
+                                    'code': 'stream_retry_non_streaming_response',
+                                    'message': 'Upstream retry returned a non-streaming response.',
+                                    'type': 'upstream_error',
+                                }
+                            )
+                            return
+
+                        current_response = retry_response
+                        current_form_data = retry_form_data
+
+                await stream_with_retries(response, form_data)
 
                 tool_call_retries = 0
                 tool_call_sources = []  # Track citation sources from tool results
