@@ -1,5 +1,6 @@
 from open_webui.utils.middleware import (
     build_responses_reasoning_placeholder,
+    build_responses_web_search_status,
     _count_stream_retry_visible_chars,
     _is_retryable_stream_error,
     _stream_retryable,
@@ -91,6 +92,58 @@ def test_web_search_completed_event_renders_before_response_completed():
     assert 'done="true"' in rendered
     assert 'codex sandbox settings' in rendered
     assert 'https://example.com/codex' in rendered
+
+
+def test_web_search_call_builds_realtime_status_with_sources():
+    status = build_responses_web_search_status(
+        {
+            'type': 'web_search_call',
+            'id': 'ws_123',
+            'status': 'completed',
+            'action': {
+                'type': 'search',
+                'query': 'codex sandbox settings',
+                'sources': [
+                    {
+                        'type': 'url',
+                        'url': 'https://example.com/codex',
+                        'title': 'Codex sandbox',
+                    }
+                ],
+            },
+        }
+    )
+
+    assert status == {
+        'action': 'web_search',
+        'description': 'Searched {{count}} sites',
+        'done': True,
+        'id': 'ws_123',
+        'query': 'codex sandbox settings',
+        'items': [{'link': 'https://example.com/codex', 'title': 'Codex sandbox'}],
+    }
+
+
+def test_web_search_call_builds_realtime_status_while_searching():
+    status = build_responses_web_search_status(
+        {
+            'type': 'web_search_call',
+            'id': 'ws_123',
+            'status': 'in_progress',
+            'action': {
+                'type': 'search',
+                'queries': ['codex sandbox settings'],
+            },
+        }
+    )
+
+    assert status == {
+        'action': 'web_search',
+        'description': 'Searching "{{searchQuery}}"',
+        'done': False,
+        'id': 'ws_123',
+        'query': 'codex sandbox settings',
+    }
 
 
 def test_retryable_stream_error_detection_accepts_stream_read_error():

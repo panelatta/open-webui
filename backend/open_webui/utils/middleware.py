@@ -876,6 +876,81 @@ def handle_responses_tool_status_event(
     return new_output, {}
 
 
+def build_responses_web_search_status(item: dict) -> dict | None:
+    if not isinstance(item, dict) or item.get('type') != 'web_search_call':
+        return None
+
+    action = item.get('action') if isinstance(item.get('action'), dict) else {}
+    status = item.get('status', 'in_progress')
+    done = status in ('completed', 'failed', 'incomplete')
+
+    sources = action.get('sources') if isinstance(action.get('sources'), list) else []
+    urls = []
+    items = []
+
+    def add_source(source):
+        if isinstance(source, str):
+            if source and source not in urls:
+                urls.append(source)
+            return
+
+        if not isinstance(source, dict):
+            return
+
+        url = source.get('url') or source.get('source') or source.get('link') or ''
+        title = source.get('title') or source.get('name') or url
+        if not url:
+            return
+
+        if title and title != url:
+            item_entry = {'link': url, 'title': title}
+            if item_entry not in items:
+                items.append(item_entry)
+        elif url not in urls:
+            urls.append(url)
+
+    for source in sources:
+        add_source(source)
+
+    page_url = action.get('url')
+    if page_url:
+        add_source({'url': page_url, 'title': action.get('title') or page_url})
+
+    queries = action.get('queries') if isinstance(action.get('queries'), list) else []
+    query = action.get('query') or (str(queries[0]) if queries else '') or page_url or ''
+
+    action_type = action.get('type', '')
+    if status == 'failed':
+        description = 'Web search failed'
+    elif done and (items or urls):
+        description = 'Searched {{count}} sites'
+    elif query:
+        description = 'Searching "{{searchQuery}}"'
+    elif action_type == 'open_page':
+        description = 'Opening web page'
+    elif action_type == 'find_in_page':
+        description = 'Searching within web page'
+    else:
+        description = 'Searching the web'
+
+    status_data = {
+        'action': 'web_search',
+        'description': description,
+        'done': done,
+    }
+
+    if item.get('id'):
+        status_data['id'] = item.get('id')
+    if query:
+        status_data['query'] = query
+    if items:
+        status_data['items'] = items
+    elif urls:
+        status_data['urls'] = urls
+
+    return status_data
+
+
 def deep_merge(target, source):
     """
     Merge source into target recursively (returning new structure).
@@ -4173,6 +4248,7 @@ async def streaming_chat_response_handler(response, ctx):
             usage = None
             prior_output = []
             last_response_id = None
+            responses_web_search_status_signatures = {}
 
             def full_output():
                 return prior_output + output if prior_output else output
@@ -4220,6 +4296,7 @@ async def streaming_chat_response_handler(response, ctx):
                 usage = None
                 output = []
                 last_response_id = None
+                responses_web_search_status_signatures.clear()
                 tool_calls.clear()
 
                 reset_output = full_output()
@@ -4278,6 +4355,28 @@ async def streaming_chat_response_handler(response, ctx):
                         },
                     }
                 )
+
+            async def emit_responses_web_search_statuses(items: list):
+                for item in items or []:
+                    status_data = build_responses_web_search_status(item)
+                    if not status_data:
+                        continue
+
+                    status_key = status_data.get('id') or item.get('id')
+                    if not status_key:
+                        continue
+
+                    signature = json.dumps(status_data, sort_keys=True, ensure_ascii=False)
+                    if responses_web_search_status_signatures.get(status_key) == signature:
+                        continue
+
+                    responses_web_search_status_signatures[status_key] = signature
+                    await event_emitter(
+                        {
+                            'type': 'status',
+                            'data': status_data,
+                        }
+                    )
 
             reasoning_tags_param = metadata.get('params', {}).get('reasoning_tags')
             DETECT_REASONING_TAGS = reasoning_tags_param is not False
@@ -4436,6 +4535,8 @@ async def streaming_chat_response_handler(response, ctx):
                                                                     },
                                                                 }
                                                             )
+
+                                    await emit_responses_web_search_statuses(output)
 
                                     processed_data = {
                                         'output': full_output(),
