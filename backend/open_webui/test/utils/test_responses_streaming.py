@@ -94,6 +94,52 @@ def test_web_search_completed_event_renders_before_response_completed():
     assert 'https://example.com/codex' in rendered
 
 
+def test_web_search_output_item_done_merges_sources_before_response_completed():
+    output, metadata = handle_responses_streaming_event(
+        {
+            'type': 'response.output_item.done',
+            'output_index': 0,
+            'item': {
+                'type': 'web_search_call',
+                'id': 'ws_123',
+                'status': 'completed',
+                'action': {
+                    'type': 'search',
+                    'query': 'codex sandbox settings',
+                    'sources': [
+                        {
+                            'type': 'url',
+                            'url': 'https://example.com/codex',
+                            'title': 'Codex sandbox',
+                        }
+                    ],
+                },
+            },
+        },
+        [
+            {
+                'type': 'web_search_call',
+                'id': 'ws_123',
+                'status': 'in_progress',
+            }
+        ],
+    )
+
+    assert metadata == {}
+    assert output[0]['status'] == 'completed'
+    assert output[0]['action']['query'] == 'codex sandbox settings'
+
+    status = build_responses_web_search_status(output[0])
+    assert status == {
+        'action': 'web_search',
+        'description': 'Searched {{count}} sites',
+        'done': True,
+        'id': 'ws_123',
+        'query': 'codex sandbox settings',
+        'items': [{'link': 'https://example.com/codex', 'title': 'Codex sandbox'}],
+    }
+
+
 def test_web_search_call_builds_realtime_status_with_sources():
     status = build_responses_web_search_status(
         {

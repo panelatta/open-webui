@@ -1193,7 +1193,11 @@ def handle_responses_streaming_event(
 
             return new_output, None
 
-    elif event_type.startswith('response.') and event_type.endswith('.done'):
+    elif (
+        event_type.startswith('response.')
+        and event_type.endswith('.done')
+        and event_type != 'response.output_item.done'
+    ):
         # Delta Events: response.content_part.done, response.text.done, etc.
         parts = event_type.split('.')
         if len(parts) >= 3:
