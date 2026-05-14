@@ -42,7 +42,11 @@ def get_memory_content_embedding_prompt() -> Optional[str]:
 
 
 async def embed_memory_content(request: Request, content: str, user) -> list[float]:
-    return await request.app.state.EMBEDDING_FUNCTION(
+    embedding_function = getattr(request.app.state, 'MEMORY_EMBEDDING_FUNCTION', None)
+    if embedding_function is None:
+        raise HTTPException(status_code=503, detail='Memory embedding function is not configured')
+
+    return await embedding_function(
         content,
         prefix=get_memory_content_embedding_prompt(),
         user=user,
@@ -50,7 +54,11 @@ async def embed_memory_content(request: Request, content: str, user) -> list[flo
 
 
 async def embed_memory_query(request: Request, content: str, user) -> list[float]:
-    return await request.app.state.EMBEDDING_FUNCTION(
+    embedding_function = getattr(request.app.state, 'MEMORY_EMBEDDING_FUNCTION', None)
+    if embedding_function is None:
+        raise HTTPException(status_code=503, detail='Memory embedding function is not configured')
+
+    return await embedding_function(
         content,
         prefix=get_memory_query_embedding_prompt(request),
         user=user,

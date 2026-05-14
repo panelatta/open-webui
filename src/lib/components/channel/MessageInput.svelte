@@ -436,7 +436,7 @@
 		});
 	};
 
-	const uploadFileHandler = async (file, process = true) => {
+	const uploadFileHandler = async (file, process = false) => {
 		const tempItemId = uuidv4();
 		const fileItem = {
 			type: 'file',
@@ -459,7 +459,6 @@
 		files = [...files, fileItem];
 
 		try {
-			// During the file upload, file content is automatically extracted.
 			// If the file is an audio file, provide the language for STT.
 			let metadata = {
 				channel_id: channel.id,

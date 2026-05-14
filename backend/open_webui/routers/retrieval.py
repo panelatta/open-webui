@@ -40,6 +40,7 @@ from open_webui.models.files import FileModel, FileUpdateForm, Files
 from open_webui.utils.access_control.files import has_access_to_file
 from open_webui.models.knowledge import Knowledges
 from open_webui.storage.provider import Storage
+from open_webui.utils.embedding_policy import EMBEDDING_DISABLED_MESSAGE, apply_memory_only_embedding_policy
 from open_webui.internal.db import get_async_db, get_async_session
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -333,7 +334,7 @@ def unload_embedding_model(request: Request):
     if request.app.state.config.RAG_EMBEDDING_ENGINE == '':
         # unloads current internal embedding model and clears VRAM cache
         request.app.state.ef = None
-        request.app.state.EMBEDDING_FUNCTION = None
+        apply_memory_only_embedding_policy(request.app.state, None)
         import gc
 
         gc.collect()
@@ -380,7 +381,7 @@ async def update_embedding_config(request: Request, form_data: EmbeddingModelUpd
             request.app.state.config.RAG_EMBEDDING_MODEL,
         )
 
-        request.app.state.EMBEDDING_FUNCTION = get_embedding_function(
+        memory_embedding_function = get_embedding_function(
             request.app.state.config.RAG_EMBEDDING_ENGINE,
             request.app.state.config.RAG_EMBEDDING_MODEL,
             request.app.state.ef,
@@ -411,6 +412,8 @@ async def update_embedding_config(request: Request, form_data: EmbeddingModelUpd
             enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
             concurrent_requests=request.app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
         )
+
+        apply_memory_only_embedding_policy(request.app.state, memory_embedding_function)
 
         return {
             'status': True,
@@ -1381,6 +1384,8 @@ def save_docs_to_vector_db(
         return ', '.join(docs_info)
 
     log.debug(f'save_docs_to_vector_db: document {_get_docs_info(docs)} {collection_name}')
+    log.info('Blocked vector DB embedding for %s: %s', collection_name, EMBEDDING_DISABLED_MESSAGE)
+    raise RuntimeError(EMBEDDING_DISABLED_MESSAGE)
 
     # Check if entries with the same hash (metadata.hash) already exist
     if metadata and 'hash' in metadata:
@@ -1827,53 +1832,34 @@ async def process_text(
 async def process_web(
     request: Request,
     form_data: ProcessUrlForm,
-    process: bool = Query(True, description='Whether to process and save the content'),
+    process: bool = Query(False, description='Whether to process and save the content'),
     overwrite: bool = Query(True, description='Whether to overwrite existing collection'),
     user=Depends(get_verified_user),
 ):
+    if process:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=EMBEDDING_DISABLED_MESSAGE)
+
     try:
         content, docs = await run_in_threadpool(get_content_from_url, request, form_data.url)
         log.debug(f'text_content: {content}')
 
-        if process:
-            collection_name = form_data.collection_name
-            if not collection_name:
-                collection_name = calculate_sha256_string(form_data.url)[:63]
-            else:
-                await _validate_collection_access([collection_name], user, access_type='write')
-
-            if not request.app.state.config.BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL:
-                await run_in_threadpool(
-                    save_docs_to_vector_db,
-                    request,
-                    docs,
-                    collection_name,
-                    overwrite=overwrite,
-                    add=(not overwrite),
-                    user=user,
-                )
-            else:
-                collection_name = None
-
-            return {
-                'status': True,
-                'collection_name': collection_name,
-                'filename': form_data.url,
-                'file': {
-                    'data': {
-                        'content': content,
-                    },
-                    'meta': {
-                        'name': form_data.url,
-                        'source': form_data.url,
-                    },
+        return {
+            'status': True,
+            'collection_name': None,
+            'filename': form_data.url,
+            'content': content,
+            'file': {
+                'data': {
+                    'content': content,
                 },
-            }
-        else:
-            return {
-                'status': True,
-                'content': content,
-            }
+                'meta': {
+                    'name': form_data.url,
+                    'source': form_data.url,
+                },
+            },
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -2309,44 +2295,20 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
             dict(item) for item in result_items if item.link in urls
         ]  # only keep the search results that have been loaded
 
-        if request.app.state.config.BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL:
-            return {
-                'status': True,
-                'collection_name': None,
-                'filenames': urls,
-                'items': result_items,
-                'docs': [
-                    {
-                        'content': doc.page_content,
-                        'metadata': doc.metadata,
-                    }
-                    for doc in docs
-                ],
-                'loaded_count': len(docs),
-            }
-        else:
-            # Create a single collection for all documents
-            collection_name = f'web-search-{calculate_sha256_string("-".join(form_data.queries))}'[:63]
-
-            try:
-                await run_in_threadpool(
-                    save_docs_to_vector_db,
-                    request,
-                    docs,
-                    collection_name,
-                    overwrite=True,
-                    user=user,
-                )
-            except Exception as e:
-                log.debug(f'error saving docs: {e}')
-
-            return {
-                'status': True,
-                'collection_names': [collection_name],
-                'items': result_items,
-                'filenames': urls,
-                'loaded_count': len(docs),
-            }
+        return {
+            'status': True,
+            'collection_name': None,
+            'filenames': urls,
+            'items': result_items,
+            'docs': [
+                {
+                    'content': doc.page_content,
+                    'metadata': doc.metadata,
+                }
+                for doc in docs
+            ],
+            'loaded_count': len(docs),
+        }
     except Exception as e:
         log.exception(e)
         raise HTTPException(

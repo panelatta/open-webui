@@ -1003,15 +1003,17 @@
 		for (const fileItem of fileItems) {
 			try {
 				const res = isYoutubeUrl(fileItem.url)
-					? await processYoutubeVideo(localStorage.token, fileItem.url)
-					: await processWeb(localStorage.token, '', fileItem.url);
+					? await processYoutubeVideo(localStorage.token, fileItem.url, false)
+					: await processWeb(localStorage.token, '', fileItem.url, false);
 
 				if (res) {
+					const content = res.content ?? res.file?.data?.content ?? '';
 					fileItem.status = 'uploaded';
-					fileItem.collection_name = res.collection_name;
-					fileItem.file = {
-						...res.file,
-						...fileItem.file
+					fileItem.collection_name = res.collection_name ?? '';
+					fileItem.content = content;
+					fileItem.file = res.file ?? {
+						data: { content },
+						meta: { name: fileItem.url, source: fileItem.url }
 					};
 				}
 

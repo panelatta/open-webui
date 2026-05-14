@@ -553,7 +553,10 @@ from open_webui.utils.chat import (
     chat_completed as chat_completed_handler,
 )
 from open_webui.utils.actions import chat_action as chat_action_handler
-from open_webui.utils.embeddings import generate_embeddings
+from open_webui.utils.embedding_policy import (
+    EMBEDDING_DISABLED_MESSAGE,
+    apply_memory_only_embedding_policy,
+)
 from open_webui.utils.middleware import (
     build_chat_response_context,
     process_chat_payload,
@@ -1233,6 +1236,7 @@ app.state.config.FIRECRAWL_TIMEOUT = FIRECRAWL_TIMEOUT
 app.state.config.TAVILY_EXTRACT_DEPTH = TAVILY_EXTRACT_DEPTH
 
 app.state.EMBEDDING_FUNCTION = None
+app.state.MEMORY_EMBEDDING_FUNCTION = None
 app.state.RERANKING_FUNCTION = None
 app.state.ef = None
 app.state.rf = None
@@ -1257,7 +1261,7 @@ except Exception as e:
     pass
 
 
-app.state.EMBEDDING_FUNCTION = get_embedding_function(
+memory_embedding_function = get_embedding_function(
     app.state.config.RAG_EMBEDDING_ENGINE,
     app.state.config.RAG_EMBEDDING_MODEL,
     embedding_function=app.state.ef,
@@ -1288,6 +1292,8 @@ app.state.EMBEDDING_FUNCTION = get_embedding_function(
     enable_async=app.state.config.ENABLE_ASYNC_EMBEDDING,
     concurrent_requests=app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
 )
+
+apply_memory_only_embedding_policy(app.state, memory_embedding_function)
 
 app.state.RERANKING_FUNCTION = get_reranking_function(
     app.state.config.RAG_RERANKING_ENGINE,
@@ -1743,8 +1749,7 @@ async def embeddings(request: Request, form_data: dict, user=Depends(get_verifie
     # Make sure models are loaded in app state
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
-    # Use generic dispatcher in utils.embeddings
-    return await generate_embeddings(request, form_data, user)
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=EMBEDDING_DISABLED_MESSAGE)
 
 
 @app.post('/api/chat/completions')

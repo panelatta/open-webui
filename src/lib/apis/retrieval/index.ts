@@ -296,10 +296,16 @@ export interface SearchDocument {
 	filenames: string[];
 }
 
-export const processYoutubeVideo = async (token: string, url: string) => {
+export const processYoutubeVideo = async (token: string, url: string, process: boolean = false) => {
 	let error = null;
 
-	const res = await fetch(`${RETRIEVAL_API_BASE_URL}/process/youtube`, {
+	const searchParams = new URLSearchParams();
+
+	if (!process) {
+		searchParams.append('process', 'false');
+	}
+
+	const res = await fetch(`${RETRIEVAL_API_BASE_URL}/process/youtube?${searchParams.toString()}`, {
 		method: 'POST',
 		headers: {
 			Accept: 'application/json',
@@ -331,7 +337,7 @@ export const processWeb = async (
 	token: string,
 	collection_name: string,
 	url: string,
-	process: boolean = true
+	process: boolean = false
 ) => {
 	let error = null;
 

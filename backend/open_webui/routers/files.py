@@ -189,7 +189,7 @@ async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     metadata: Optional[dict | str] = Form(None),
-    process: bool = Query(True),
+    process: bool = Query(False),
     process_in_background: bool = Query(True),
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
@@ -210,7 +210,7 @@ async def upload_file_handler(
     request: Request,
     file: UploadFile = File(...),
     metadata: Optional[dict | str] = Form(None),
-    process: bool = Query(True),
+    process: bool = Query(False),
     process_in_background: bool = Query(True),
     user=Depends(get_verified_user),
     background_tasks: Optional[BackgroundTasks] = None,
@@ -226,7 +226,15 @@ async def upload_file_handler(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT('Invalid metadata format'),
             )
-    file_metadata = metadata if metadata else {}
+    file_metadata = metadata if isinstance(metadata, dict) else {}
+
+    if process:
+        log.info(
+            'File processing disabled in this deployment; storing %s without local extraction or embedding',
+            file.filename,
+        )
+        process = False
+        process_in_background = False
 
     try:
         unsanitized_filename = file.filename
