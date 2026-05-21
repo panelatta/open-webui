@@ -70,6 +70,64 @@ from open_webui.utils.access_control.files import has_access_to_file
 ############################
 
 
+TEXT_CONTENT_CACHE_MAX_BYTES = 1_000_000
+TEXT_CONTENT_TYPES = {
+    'application/javascript',
+    'application/json',
+    'application/toml',
+    'application/x-sh',
+    'application/x-shellscript',
+    'application/x-yaml',
+    'application/xhtml+xml',
+    'application/xml',
+    'application/yaml',
+}
+TEXT_FILE_EXTENSIONS = {
+    'bash',
+    'cfg',
+    'conf',
+    'csv',
+    'env',
+    'ini',
+    'js',
+    'json',
+    'log',
+    'md',
+    'properties',
+    'py',
+    'sh',
+    'sql',
+    'toml',
+    'tsv',
+    'txt',
+    'xml',
+    'yaml',
+    'yml',
+}
+
+
+def _is_textual_upload(content_type: Optional[str], filename: str) -> bool:
+    normalized_type = (content_type or '').split(';', 1)[0].strip().lower()
+    if normalized_type.startswith('text/'):
+        return True
+    if normalized_type in TEXT_CONTENT_TYPES or normalized_type.endswith(('+json', '+xml')):
+        return True
+    return Path(filename).suffix.lower().lstrip('.') in TEXT_FILE_EXTENSIONS
+
+
+def _extract_text_content_for_chat(contents: bytes, content_type: Optional[str], filename: str) -> Optional[str]:
+    if len(contents) > TEXT_CONTENT_CACHE_MAX_BYTES:
+        return None
+    if not _is_textual_upload(content_type, filename):
+        return None
+    if b'\x00' in contents[:8192]:
+        return None
+    try:
+        return contents.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return None
+
+
 def _is_text_file(file_path: str, chunk_size: int = 8192) -> bool:
     """Check if a file is likely a text file by reading a chunk and validating UTF-8.
 
@@ -271,6 +329,18 @@ async def upload_file_handler(
             },
         )
 
+        file_data = {
+            **({'status': 'pending'} if process else {}),
+        }
+        if not process:
+            text_content = _extract_text_content_for_chat(
+                contents,
+                file.content_type if isinstance(file.content_type, str) else None,
+                name,
+            )
+            if text_content is not None:
+                file_data['content'] = text_content
+
         file_item = await Files.insert_new_file(
             user.id,
             FileForm(
@@ -278,9 +348,7 @@ async def upload_file_handler(
                     'id': id,
                     'filename': name,
                     'path': file_path,
-                    'data': {
-                        **({'status': 'pending'} if process else {}),
-                    },
+                    'data': file_data,
                     'meta': {
                         'name': name,
                         'content_type': (file.content_type if isinstance(file.content_type, str) else None),

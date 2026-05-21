@@ -432,6 +432,12 @@ async def get_builtin_tools(
     if is_builtin_tool_enabled('time'):
         builtin_functions.extend([get_current_timestamp, calculate_timestamp])
 
+    metadata = extra_params.get('__metadata__') or {}
+    if get_model_capability('file_context') and (
+        metadata.get('has_attached_files') or metadata.get('files')
+    ):
+        builtin_functions.append(view_file)
+
     # Knowledge base tools - conditional injection based on model knowledge
     # If model has attached knowledge (any type), only provide query_knowledge_files
     # Otherwise, provide all KB browsing tools

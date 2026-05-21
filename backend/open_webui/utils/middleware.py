@@ -2108,6 +2108,23 @@ async def get_image_urls(delta_images, request, metadata, user) -> list[str]:
     return image_urls
 
 
+def has_attached_file_context(messages: list) -> bool:
+    for message in messages or []:
+        content = message.get('content', '') if isinstance(message, dict) else ''
+        if isinstance(content, str):
+            if '<attached_files>' in content:
+                return True
+        elif isinstance(content, list):
+            for part in content:
+                if (
+                    isinstance(part, dict)
+                    and part.get('type') == 'text'
+                    and '<attached_files>' in part.get('text', '')
+                ):
+                    return True
+    return False
+
+
 async def add_file_context(messages: list, chat_id: str, user) -> list:
     """
     Add file URLs to messages for native function calling.
@@ -3245,6 +3262,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             # Add file context to user messages
             chat_id = metadata.get('chat_id')
             form_data['messages'] = await add_file_context(form_data.get('messages', []), chat_id, user)
+            metadata['has_attached_files'] = has_attached_file_context(form_data.get('messages', []))
             builtin_tools = await get_builtin_tools(
                 request,
                 {

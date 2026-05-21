@@ -1417,6 +1417,29 @@ def convert_to_responses_payload(payload: dict) -> dict:
                     url_data = part.get('image_url', {})
                     url = url_data.get('url', '') if isinstance(url_data, dict) else url_data
                     content_parts.append({'type': 'input_image', 'image_url': url})
+                elif part.get('type') in {'input_file', 'file'}:
+                    input_file = {'type': 'input_file'}
+
+                    file_id = part.get('file_id')
+                    nested_file = part.get('file')
+                    if not file_id and isinstance(nested_file, dict):
+                        file_id = nested_file.get('file_id')
+
+                    if file_id:
+                        input_file['file_id'] = file_id
+                    if part.get('file_data'):
+                        input_file['file_data'] = part.get('file_data')
+                    if part.get('file_url'):
+                        input_file['file_url'] = part.get('file_url')
+
+                    filename = part.get('filename')
+                    if not filename and isinstance(nested_file, dict):
+                        filename = nested_file.get('filename')
+                    if filename:
+                        input_file['filename'] = filename
+
+                    if len(input_file) > 1:
+                        content_parts.append(input_file)
         else:
             content_parts = [{'type': text_type, 'text': str(content)}]
 
