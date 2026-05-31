@@ -76,7 +76,7 @@ from open_webui.retrieval.utils import get_sources_from_items
 
 
 from open_webui.utils.sanitize import sanitize_code
-from open_webui.utils.chat import generate_chat_completion
+from open_webui.utils.chat import generate_chat_completion, resume_response_stream
 from open_webui.utils.task import (
     get_task_model_id,
     rag_template,
@@ -99,6 +99,7 @@ from open_webui.utils.misc import (
     convert_logit_bias_input_to_json,
     get_content_from_message,
     convert_output_to_messages,
+    convert_web_search_output_to_resume_message,
     strip_empty_content_blocks,
 )
 from open_webui.utils.tools import (
@@ -143,6 +144,9 @@ from open_webui.env import (
     FORWARD_SESSION_INFO_HEADER_CHAT_ID,
     FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
     ENABLE_RESPONSES_API_STATEFUL,
+    ENABLE_RESPONSES_API_BACKGROUND_RESUME,
+    RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS,
+    RESPONSES_API_CONTEXTUAL_RETRY_TOOL_ALLOWLIST,
 )
 from open_webui.utils.headers import include_user_info_headers
 from open_webui.constants import TASKS
@@ -419,13 +423,197 @@ class RetryableStreamError(Exception):
         super().__init__(str(error))
 
 
+class StreamFatalError(Exception):
+    def __init__(self, error: Any):
+        self.error = error
+        super().__init__(str(error))
+
+
+class ResponsesStreamState:
+    def __init__(self, route_idx: int | None = None, route_url: str | None = None):
+        self.started_at = time.monotonic()
+        self.last_event_at = None
+        self.seen_event = False
+        self.completed = False
+        self.failed = False
+        self.last_event_type = None
+        self.response_id = None
+        self.last_sequence_number = None
+        self.last_output_item_type = None
+        self.last_output_item_status = None
+        self.route_idx = route_idx
+        self.route_url = route_url
+        self.is_responses_stream = route_idx is not None or bool(route_url)
+
+    def observe(self, data: dict, output: list):
+        event_type = data.get('type', '')
+        if not event_type.startswith('response.'):
+            return
+
+        now = time.monotonic()
+        self.is_responses_stream = True
+        self.seen_event = True
+        self.last_event_at = now
+        self.last_event_type = event_type
+
+        sequence_number = data.get('sequence_number')
+        if isinstance(sequence_number, int):
+            self.last_sequence_number = sequence_number
+
+        response = data.get('response')
+        if isinstance(response, dict) and response.get('id'):
+            self.response_id = response.get('id')
+
+        response_id = data.get('response_id')
+        if response_id:
+            self.response_id = response_id
+
+        item = data.get('item')
+        if isinstance(item, dict):
+            self.last_output_item_type = item.get('type')
+            self.last_output_item_status = item.get('status')
+        elif output:
+            last_item = output[-1]
+            if isinstance(last_item, dict):
+                self.last_output_item_type = last_item.get('type')
+                self.last_output_item_status = last_item.get('status')
+
+        if event_type == 'response.completed':
+            self.completed = True
+        elif event_type == 'response.failed':
+            self.failed = True
+
+    def incomplete_error(self) -> dict | None:
+        if not self.is_responses_stream or self.completed or self.failed:
+            return None
+
+        now = time.monotonic()
+        last_event_age = None
+        if self.last_event_at is not None:
+            last_event_age = round(now - self.last_event_at, 3)
+
+        if not self.seen_event:
+            return {
+                'code': 'stream_empty_eof',
+                'message': 'Responses API stream ended before any response event was received.',
+                'type': 'upstream_error',
+                'last_event_type': None,
+                'response_id': self.response_id,
+                'last_sequence_number': self.last_sequence_number,
+                'response_route_idx': self.route_idx,
+                'response_route_url': self.route_url,
+                'duration': round(now - self.started_at, 3),
+                'idle': last_event_age,
+            }
+
+        return {
+            'code': 'stream_incomplete_eof',
+            'message': 'Responses API stream ended before response.completed.',
+            'type': 'upstream_error',
+            'last_event_type': self.last_event_type,
+            'response_id': self.response_id,
+            'last_sequence_number': self.last_sequence_number,
+            'response_route_idx': self.route_idx,
+            'response_route_url': self.route_url,
+            'last_output_item_type': self.last_output_item_type,
+            'last_output_item_status': self.last_output_item_status,
+            'duration': round(now - self.started_at, 3),
+            'idle': last_event_age,
+        }
+
+
+def _responses_stream_error_from_exception(
+    error: Exception,
+    responses_stream_state: ResponsesStreamState | None,
+) -> dict | None:
+    if responses_stream_state is not None:
+        if responses_stream_state.completed:
+            return None
+
+        incomplete_error = responses_stream_state.incomplete_error()
+        if incomplete_error:
+            incomplete_error['transport_error'] = {
+                'code': error.__class__.__name__,
+                'message': str(error),
+                'type': 'transport_error',
+            }
+            return incomplete_error
+
+    return {
+        'code': error.__class__.__name__,
+        'message': str(error),
+        'type': 'transport_error',
+    }
+
+
+def _responses_stream_cursor_from_error(
+    error: Any,
+    responses_stream_state: ResponsesStreamState | None = None,
+) -> dict:
+    cursor = {}
+
+    if isinstance(error, dict):
+        response_id = error.get('response_id')
+        sequence_number = error.get('last_sequence_number')
+        if sequence_number is None:
+            sequence_number = error.get('response_sequence_number')
+
+        values = {
+            'response_id': response_id,
+            'response_sequence_number': sequence_number,
+            'response_route_idx': error.get('response_route_idx'),
+            'response_route_url': error.get('response_route_url'),
+        }
+        cursor.update({key: value for key, value in values.items() if value is not None})
+
+    if responses_stream_state is not None:
+        fallback_values = {
+            'response_id': responses_stream_state.response_id,
+            'response_sequence_number': responses_stream_state.last_sequence_number,
+            'response_route_idx': responses_stream_state.route_idx,
+            'response_route_url': responses_stream_state.route_url,
+        }
+        for key, value in fallback_values.items():
+            if value is not None and cursor.get(key) is None:
+                cursor[key] = value
+
+    return cursor
+
+
+def _next_response_background_resume_attempt(
+    attempts_by_response_id: dict[str, int],
+    error: Any,
+    max_attempts: int,
+) -> int | None:
+    if not isinstance(error, dict) or max_attempts <= 0:
+        return None
+
+    response_id = error.get('response_id')
+    if not response_id:
+        return None
+
+    attempt = attempts_by_response_id.get(response_id, 0)
+    if attempt >= max_attempts:
+        return None
+
+    attempt += 1
+    attempts_by_response_id[response_id] = attempt
+    return attempt
+
+
 def _is_retryable_stream_error(error: Any) -> bool:
     if isinstance(error, dict):
         code = str(error.get('code', '')).lower()
         message = str(error.get('message', '')).lower()
         error_type = str(error.get('type', '')).lower()
 
-        if code == 'stream_read_error' or message == 'stream_read_error':
+        if code == 'response_failed' or error.get('last_event_type') == 'response.failed':
+            return False
+
+        if code in {'stream_read_error', 'stream_incomplete_eof', 'stream_empty_eof'}:
+            return True
+
+        if message in {'stream_read_error', 'stream_incomplete_eof', 'stream_empty_eof'}:
             return True
 
         if error_type == 'upstream_error' and (
@@ -470,7 +658,6 @@ def _stream_retryable(output: list) -> bool:
     blocked_item_types = {
         'open_webui:code_interpreter',
         'computer_call',
-        'function_call_output',
     }
 
     for item in output or []:
@@ -478,6 +665,125 @@ def _stream_retryable(output: list) -> bool:
             return False
 
     return True
+
+
+def _output_item_text(item: dict) -> str:
+    parts = []
+
+    content = item.get('content')
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get('text')
+                if isinstance(text, str):
+                    parts.append(text)
+    elif isinstance(content, str):
+        parts.append(content)
+
+    summary = item.get('summary')
+    if isinstance(summary, list):
+        for part in summary:
+            if isinstance(part, dict):
+                text = part.get('text')
+                if isinstance(text, str):
+                    parts.append(text)
+
+    return ''.join(parts)
+
+
+def _clean_output_for_contextual_retry(items: list) -> list:
+    cleaned = []
+    function_calls_by_call_id = {}
+
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+
+        if item.get('type') != 'function_call':
+            continue
+
+        call_id = item.get('call_id')
+        name = item.get('name')
+        arguments = item.get('arguments')
+        if call_id and name and str(arguments or '').strip():
+            function_calls_by_call_id[call_id] = copy.deepcopy(item)
+
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get('type')
+        cloned = copy.deepcopy(item)
+
+        if item_type == 'message':
+            if not _output_item_text(cloned).strip():
+                continue
+            cloned['status'] = 'completed'
+            cleaned.append(cloned)
+            continue
+
+        if item_type == 'reasoning':
+            # Do not replay ordinary reasoning summaries as durable state.
+            # If a provider exposes encrypted reasoning carry-over accepted by
+            # CPA/OpenAI, add a separate allowlisted branch for that format.
+            continue
+
+        if item_type == 'function_call_output':
+            call_id = cloned.get('call_id')
+            call_item = function_calls_by_call_id.get(call_id)
+            tool_name = call_item.get('name') if call_item else None
+
+            if (
+                call_id
+                and call_item
+                and tool_name in RESPONSES_API_CONTEXTUAL_RETRY_TOOL_ALLOWLIST
+            ):
+                cleaned.append(call_item)
+                cleaned.append(cloned)
+            continue
+
+        if item_type == 'function_call':
+            # Function calls are replayed only together with an allowlisted
+            # completed function_call_output in the branch above.
+            continue
+
+        if item_type == 'web_search_call':
+            if cloned.get('status') == 'completed':
+                cleaned.append(cloned)
+            continue
+
+        # Fail closed for hosted tools and any unknown item shapes. Only the
+        # explicit branches above are safe to replay into contextual retry.
+
+    return cleaned
+
+
+def _build_stream_resume_instruction(error: Any, retry_output: list) -> dict:
+    last_text = ''
+    for item in reversed(retry_output or []):
+        if isinstance(item, dict) and item.get('type') == 'message':
+            last_text = _output_item_text(item).strip()
+            if last_text:
+                break
+
+    instruction = (
+        'The previous streaming response was interrupted before a final '
+        'response.completed event. Continue the same task from the context above. '
+        'Do not repeat completed tool work. If the previous assistant message '
+        'already contains partial prose, continue from the last unfinished point '
+        'instead of restarting the answer.'
+    )
+
+    if last_text:
+        instruction += f'\n\nLast partial assistant text:\n{last_text[-1200:]}'
+
+    if isinstance(error, dict):
+        instruction += (
+            f"\n\nInterruption detail: {error.get('code') or 'stream_error'}; "
+            f"last event: {error.get('last_event_type') or 'unknown'}."
+        )
+
+    return {'role': 'user', 'content': instruction}
 
 
 def _format_openai_web_search_sources(sources: list) -> str:
@@ -1341,7 +1647,22 @@ def handle_responses_streaming_event(
 
     elif event_type == 'response.failed':
         # State Machine Event: Failed
-        error = data.get('response', {}).get('error', {})
+        response_data = data.get('response') if isinstance(data.get('response'), dict) else {}
+        error = response_data.get('error') or data.get('error')
+        if not error:
+            error = {
+                'code': 'response_failed',
+                'message': 'Responses API emitted response.failed.',
+                'type': 'upstream_error',
+            }
+        if isinstance(error, dict):
+            error.setdefault('last_event_type', 'response.failed')
+            response_id = response_data.get('id') or data.get('response_id')
+            if response_id:
+                error.setdefault('response_id', response_id)
+            sequence_number = data.get('sequence_number')
+            if isinstance(sequence_number, int):
+                error.setdefault('last_sequence_number', sequence_number)
         return current_output, {'error': error}
 
     else:
@@ -2624,6 +2945,10 @@ def process_messages_with_output(
                 raw=True,
                 reasoning_format=reasoning_format,
             )
+            web_search_resume_message = convert_web_search_output_to_resume_message(message['output'])
+            if web_search_resume_message:
+                output_messages.append(web_search_resume_message)
+
             if output_messages:
                 processed.extend(output_messages)
                 continue
@@ -4271,6 +4596,8 @@ async def streaming_chat_response_handler(response, ctx):
             prior_output = []
             last_response_id = None
             responses_web_search_status_signatures = {}
+            latest_responses_stream_state = None
+            last_responses_retry_cursor = {}
 
             def full_output():
                 return prior_output + output if prior_output else output
@@ -4286,46 +4613,208 @@ async def streaming_chat_response_handler(response, ctx):
                     stream_response_backgrounds_completed.add(id(stream_response))
                     await stream_response.background()
 
-            async def record_stream_error(error):
+            def enrich_stream_error_with_cursor(error, include_saved_cursor=True, saved_cursor=None):
+                if not isinstance(error, dict):
+                    return error
+
+                cursor_store = last_responses_retry_cursor if saved_cursor is None else saved_cursor
+                cursor_payload = _responses_stream_cursor_from_error(
+                    error,
+                    latest_responses_stream_state,
+                )
+
+                if include_saved_cursor and cursor_store:
+                    for key, value in cursor_store.items():
+                        cursor_payload.setdefault(key, value)
+
+                if (
+                    cursor_payload.get('response_id')
+                    and cursor_payload.get('response_sequence_number') is not None
+                ):
+                    cursor_store.clear()
+                    cursor_store.update(cursor_payload)
+
+                if cursor_payload.get('response_id') is not None and error.get('response_id') is None:
+                    error['response_id'] = cursor_payload['response_id']
+
+                if (
+                    cursor_payload.get('response_sequence_number') is not None
+                    and error.get('last_sequence_number') is None
+                    and error.get('response_sequence_number') is None
+                ):
+                    error['last_sequence_number'] = cursor_payload['response_sequence_number']
+
+                if cursor_payload.get('response_route_idx') is not None and error.get('response_route_idx') is None:
+                    error['response_route_idx'] = cursor_payload['response_route_idx']
+
+                if cursor_payload.get('response_route_url') is not None and error.get('response_route_url') is None:
+                    error['response_route_url'] = cursor_payload['response_route_url']
+
+                return error
+
+            async def record_stream_error(error, saved_cursor=None, diagnostic_cursor=None):
+                error = enrich_stream_error_with_cursor(error, saved_cursor=saved_cursor)
                 log.error('Provider returned error (streaming): %s', error)
+                current_output = full_output()
+                cursor_payload = _responses_stream_cursor_from_error(
+                    error,
+                    latest_responses_stream_state,
+                )
+                cursor_store = last_responses_retry_cursor if saved_cursor is None else saved_cursor
+                if cursor_store:
+                    for key, value in cursor_store.items():
+                        cursor_payload.setdefault(key, value)
+                if diagnostic_cursor:
+                    for key, value in diagnostic_cursor.items():
+                        cursor_payload.setdefault(key, value)
+                error_payload = {'content': error}
+                message_update = {
+                    'content': serialize_output(current_output),
+                    'output': current_output,
+                    'done': False,
+                    'error': error_payload,
+                }
+                message_update.update(cursor_payload)
                 try:
                     await Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata['chat_id'],
                         metadata['message_id'],
-                        {
-                            'error': {'content': error},
-                        },
+                        message_update,
                     )
                 except Exception:
                     pass
 
+                event_data = {
+                    'content': serialize_output(full_output()),
+                    'output': full_output(),
+                    'done': False,
+                    'error': error,
+                }
+                event_data.update(cursor_payload)
                 await event_emitter(
                     {
                         'type': 'chat:completion',
+                        'data': event_data,
+                    }
+                )
+
+            async def try_resume_background_response(error, attempt):
+                if not ENABLE_RESPONSES_API_BACKGROUND_RESUME:
+                    return None
+
+                if not isinstance(error, dict):
+                    return None
+
+                response_id = error.get('response_id')
+                sequence_number = error.get('last_sequence_number')
+                route_idx = error.get('response_route_idx')
+
+                if not response_id or sequence_number is None:
+                    return None
+
+                if route_idx is None:
+                    log.warning(
+                        'Cannot resume background response without stored route '
+                        '(chat_id=%s, message_id=%s, response_id=%s)',
+                        metadata.get('chat_id'),
+                        metadata.get('message_id'),
+                        response_id,
+                    )
+                    return None
+
+                model_id_for_resume = form_data.get('model')
+                if not model_id_for_resume:
+                    return None
+
+                log.warning(
+                    'Resuming background response stream '
+                    '(attempt=%s, chat_id=%s, message_id=%s, response_id=%s, starting_after=%s, route_idx=%s)',
+                    attempt,
+                    metadata.get('chat_id'),
+                    metadata.get('message_id'),
+                    response_id,
+                    sequence_number,
+                    route_idx,
+                )
+
+                await event_emitter(
+                    {
+                        'type': 'status',
                         'data': {
-                            'error': error,
+                            'action': 'stream_resume',
+                            'description': f'Upstream stream interrupted; resuming response {response_id}',
+                            'done': False,
+                            'hidden': True,
                         },
                     }
                 )
 
-            async def reset_current_stream_for_retry(error, attempt, max_attempts):
+                try:
+                    return await resume_response_stream(
+                        request=request,
+                        model_id=model_id_for_resume,
+                        response_id=response_id,
+                        starting_after=sequence_number,
+                        route_idx=route_idx,
+                        user=user,
+                    )
+                except Exception as e:
+                    log.warning(
+                        'Background response resume setup failed; falling back '
+                        '(chat_id=%s, message_id=%s, response_id=%s, route_idx=%s): %s',
+                        metadata.get('chat_id'),
+                        metadata.get('message_id'),
+                        response_id,
+                        route_idx,
+                        e,
+                        exc_info=True,
+                    )
+                    error['background_resume_error'] = {
+                        'code': e.__class__.__name__,
+                        'message': str(e),
+                        'type': 'stream_resume_error',
+                    }
+                    return None
+
+            async def prepare_contextual_stream_retry(error, attempt, max_attempts, base_form_data):
                 nonlocal content
                 nonlocal usage
                 nonlocal output
+                nonlocal prior_output
                 nonlocal last_response_id
 
-                content = ''
+                retry_output = _clean_output_for_contextual_retry(full_output())
+                retry_messages = convert_output_to_messages(
+                    retry_output,
+                    raw=True,
+                    reasoning_format=get_reasoning_format(model),
+                )
+
+                web_search_resume_message = convert_web_search_output_to_resume_message(retry_output)
+                if web_search_resume_message:
+                    retry_messages.append(web_search_resume_message)
+
+                retry_messages.append(_build_stream_resume_instruction(error, retry_output))
+
+                retry_form_data = copy.deepcopy(base_form_data)
+                retry_form_data['stream'] = True
+                retry_form_data['metadata'] = metadata
+                retry_form_data.pop('previous_response_id', None)
+                retry_form_data['messages'] = [
+                    *base_form_data.get('messages', []),
+                    *retry_messages,
+                ]
+
+                prior_output = retry_output
+                content = serialize_output(prior_output)
                 usage = None
                 output = []
                 last_response_id = None
                 responses_web_search_status_signatures.clear()
                 tool_calls.clear()
 
-                reset_output = full_output()
-                reset_content = serialize_output(reset_output)
-
                 log.warning(
-                    'Retrying streaming response after retryable upstream error '
+                    'Falling back to contextual response retry '
                     '(attempt %s/%s, chat_id=%s, message_id=%s): %s',
                     attempt,
                     max_attempts,
@@ -4339,21 +4828,22 @@ async def streaming_chat_response_handler(response, ctx):
                         'type': 'status',
                         'data': {
                             'action': 'stream_retry',
-                            'description': f'Upstream stream interrupted; retrying ({attempt}/{max_attempts})',
+                            'description': f'Could not resume upstream response; continuing from partial context ({attempt}/{max_attempts})',
                             'done': False,
                             'hidden': True,
                         },
                     }
                 )
 
+                current_output = full_output()
                 if metadata.get('chat_id') and not metadata['chat_id'].startswith('channel:'):
                     try:
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
                             {
-                                'content': reset_content,
-                                'output': reset_output,
+                                'content': serialize_output(current_output),
+                                'output': current_output,
                                 'error': None,
                             },
                         )
@@ -4362,21 +4852,15 @@ async def streaming_chat_response_handler(response, ctx):
 
                 await event_emitter(
                     {
-                        'type': 'chat:message',
-                        'data': {
-                            'content': reset_content,
-                        },
-                    }
-                )
-                await event_emitter(
-                    {
                         'type': 'chat:completion',
                         'data': {
-                            'content': reset_content,
-                            'output': reset_output,
+                            'content': serialize_output(current_output),
+                            'output': current_output,
                         },
                     }
                 )
+
+                return retry_form_data
 
             async def emit_responses_web_search_statuses(items: list):
                 for item in items or []:
@@ -4451,6 +4935,7 @@ async def streaming_chat_response_handler(response, ctx):
                     nonlocal output
                     nonlocal prior_output
                     nonlocal last_response_id
+                    nonlocal latest_responses_stream_state
 
                     response_tool_calls = []
 
@@ -4460,6 +4945,18 @@ async def streaming_chat_response_handler(response, ctx):
                         int(metadata.get('params', {}).get('stream_delta_chunk_size') or 1),
                     )
                     last_delta_data = None
+
+                    response_route_idx = response.headers.get('x-openwebui-openai-url-idx') if response.headers else None
+                    try:
+                        response_route_idx = int(response_route_idx) if response_route_idx is not None else None
+                    except ValueError:
+                        response_route_idx = None
+
+                    responses_stream_state = ResponsesStreamState(
+                        route_idx=response_route_idx,
+                        route_url=response.headers.get('x-openwebui-openai-base-url') if response.headers else None,
+                    )
+                    latest_responses_stream_state = responses_stream_state
 
                     async def flush_pending_delta_data(threshold: int = 0):
                         nonlocal delta_count
@@ -4475,7 +4972,29 @@ async def streaming_chat_response_handler(response, ctx):
                             delta_count = 0
                             last_delta_data = None
 
-                    async for line in response.body_iterator:
+                    async def iter_response_lines():
+                        try:
+                            async for line in response.body_iterator:
+                                yield line
+                        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                            stream_error = _responses_stream_error_from_exception(
+                                e,
+                                responses_stream_state,
+                            )
+                            if stream_error is None and responses_stream_state.completed:
+                                log.warning(
+                                    'Responses stream closed after response.completed; '
+                                    'finalizing buffered output '
+                                    '(chat_id=%s, message_id=%s, response_id=%s, sequence=%s)',
+                                    metadata.get('chat_id'),
+                                    metadata.get('message_id'),
+                                    responses_stream_state.response_id,
+                                    responses_stream_state.last_sequence_number,
+                                )
+                                return
+                            raise
+
+                    async for line in iter_response_lines():
                         line = line.decode('utf-8', 'replace') if isinstance(line, bytes) else line
                         data = line
 
@@ -4522,7 +5041,9 @@ async def streaming_chat_response_handler(response, ctx):
                                     )
                                 # Check for Responses API events (type field starts with "response.")
                                 elif data.get('type', '').startswith('response.'):
+                                    responses_stream_state.observe(data, output)
                                     output, response_metadata = handle_responses_streaming_event(data, output)
+                                    responses_stream_state.observe(data, output)
 
                                     # Emit citation sources from finalized output items
                                     # (mirrors Chat Completions annotation handling at delta level)
@@ -4563,6 +5084,9 @@ async def streaming_chat_response_handler(response, ctx):
                                     processed_data = {
                                         'output': full_output(),
                                         'content': serialize_output(full_output()),
+                                        'response_id': responses_stream_state.response_id,
+                                        'response_sequence_number': responses_stream_state.last_sequence_number,
+                                        'response_route_idx': responses_stream_state.route_idx,
                                     }
 
                                     if data.get("type") in {
@@ -4571,6 +5095,31 @@ async def streaming_chat_response_handler(response, ctx):
                                         "response.failed",
                                     }:
                                         processed_data["output"] = output
+
+                                    if (
+                                        metadata.get('chat_id')
+                                        and not metadata['chat_id'].startswith('channel:')
+                                        and responses_stream_state.last_sequence_number is not None
+                                        and data.get('type') in {
+                                            'response.in_progress',
+                                            'response.output_item.done',
+                                            'response.completed',
+                                            'response.failed',
+                                        }
+                                    ):
+                                        try:
+                                            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                                                metadata['chat_id'],
+                                                metadata['message_id'],
+                                                {
+                                                    'response_id': responses_stream_state.response_id,
+                                                    'response_sequence_number': responses_stream_state.last_sequence_number,
+                                                    'response_route_idx': responses_stream_state.route_idx,
+                                                    'response_route_url': responses_stream_state.route_url,
+                                                },
+                                            )
+                                        except Exception:
+                                            pass
 
                                     # print(data)
                                     # print(processed_data)
@@ -4581,9 +5130,11 @@ async def streaming_chat_response_handler(response, ctx):
                                     # calls. The outer middleware manages the
                                     # actual completion signal.
                                     if response_metadata:
-                                        retryable_error = response_metadata.get('error')
-                                        if retryable_error and _is_retryable_stream_error(retryable_error):
-                                            raise RetryableStreamError(retryable_error)
+                                        stream_error = response_metadata.get('error')
+                                        if stream_error:
+                                            if _is_retryable_stream_error(stream_error):
+                                                raise RetryableStreamError(stream_error)
+                                            raise StreamFatalError(stream_error)
 
                                         if ENABLE_RESPONSES_API_STATEFUL:
                                             response_id = response_metadata.pop('response_id', None)
@@ -4628,7 +5179,7 @@ async def streaming_chat_response_handler(response, ctx):
                                             if _is_retryable_stream_error(error):
                                                 raise RetryableStreamError(error)
 
-                                            await record_stream_error(error)
+                                            raise StreamFatalError(error)
                                         continue
 
                                     delta = choices[0].get('delta', {})
@@ -4957,6 +5508,8 @@ async def streaming_chat_response_handler(response, ctx):
                                     )
                         except RetryableStreamError:
                             raise
+                        except StreamFatalError:
+                            raise
                         except (asyncio.CancelledError, KeyboardInterrupt):
                             raise
                         except Exception as e:
@@ -4967,6 +5520,22 @@ async def streaming_chat_response_handler(response, ctx):
                                 log.debug(f'Error: {e}')
                                 continue
                     await flush_pending_delta_data()
+
+                    incomplete_error = responses_stream_state.incomplete_error()
+                    if incomplete_error:
+                        log.warning(
+                            'Responses stream ended without response.completed '
+                            '(chat_id=%s, message_id=%s, response_id=%s, sequence=%s, route_idx=%s, last_event_type=%s, duration=%s, idle=%s)',
+                            metadata.get('chat_id'),
+                            metadata.get('message_id'),
+                            incomplete_error.get('response_id'),
+                            incomplete_error.get('last_sequence_number'),
+                            incomplete_error.get('response_route_idx'),
+                            incomplete_error.get('last_event_type'),
+                            incomplete_error.get('duration'),
+                            incomplete_error.get('idle'),
+                        )
+                        raise RetryableStreamError(incomplete_error)
 
                     if output:
                         # Clean up the last message item
@@ -5030,46 +5599,130 @@ async def streaming_chat_response_handler(response, ctx):
                         if responses_api_tool_calls:
                             tool_calls.append(_split_tool_calls(responses_api_tool_calls))
 
-                async def stream_with_retries(current_response, current_form_data):
+                async def stream_with_retries(
+                    current_response,
+                    current_form_data,
+                    *,
+                    bypass_system_prompt=False,
+                    contextual_base_messages=None,
+                ) -> bool:
+                    nonlocal output
+                    nonlocal prior_output
+
                     base_form_data = copy.deepcopy(current_form_data)
+                    if contextual_base_messages is not None:
+                        base_form_data['messages'] = copy.deepcopy(contextual_base_messages)
                     retry_attempts = max(0, CHAT_RESPONSE_STREAM_RETRY_ATTEMPTS)
-                    attempt = 0
+                    background_attempts_by_response_id = {}
+                    contextual_attempt = 0
+                    saved_retry_cursor = {}
+                    diagnostic_retry_cursor = {}
 
                     while True:
                         retry_error = None
 
                         try:
                             await stream_body_handler(current_response, current_form_data)
-                            return
+                            if prior_output:
+                                output[:0] = prior_output
+                                prior_output = []
+                            return True
                         except RetryableStreamError as e:
                             retry_error = e.error
+                        except StreamFatalError as e:
+                            await record_stream_error(e.error, saved_retry_cursor, diagnostic_retry_cursor)
+                            return False
                         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                            retry_error = {
-                                'code': e.__class__.__name__,
-                                'message': str(e),
-                                'type': 'transport_error',
-                            }
+                            retry_error = _responses_stream_error_from_exception(
+                                e,
+                                latest_responses_stream_state,
+                            )
+                            if retry_error is None:
+                                retry_error = {
+                                    'code': 'stream_completed_finalize_interrupted',
+                                    'message': (
+                                        'Responses API stream closed after response.completed '
+                                        'before handler finalization.'
+                                    ),
+                                    'type': 'upstream_error',
+                                }
+                                retry_error.update(
+                                    _responses_stream_cursor_from_error(
+                                        retry_error,
+                                        latest_responses_stream_state,
+                                    )
+                                )
+                                await record_stream_error(
+                                    retry_error,
+                                    saved_retry_cursor,
+                                    diagnostic_retry_cursor,
+                                )
+                                return False
                         finally:
                             await cleanup_stream_response(current_response)
 
-                        if attempt >= retry_attempts or not _stream_retryable(output):
-                            await record_stream_error(retry_error)
-                            return
+                        retry_error = enrich_stream_error_with_cursor(
+                            retry_error,
+                            saved_cursor=saved_retry_cursor,
+                        )
 
-                        attempt += 1
-                        await reset_current_stream_for_retry(retry_error, attempt, retry_attempts)
+                        background_attempt = None
+                        if ENABLE_RESPONSES_API_BACKGROUND_RESUME:
+                            background_attempt = _next_response_background_resume_attempt(
+                                background_attempts_by_response_id,
+                                retry_error,
+                                max(0, RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS),
+                            )
+
+                        if background_attempt is not None:
+                            retry_response = await try_resume_background_response(
+                                retry_error,
+                                background_attempt,
+                            )
+
+                            if isinstance(retry_response, StreamingResponse):
+                                current_response = retry_response
+                                continue
+
+                            if retry_response is not None:
+                                log.warning(
+                                    'Background response resume did not return a stream; falling back '
+                                    '(chat_id=%s, message_id=%s)',
+                                    metadata.get('chat_id'),
+                                    metadata.get('message_id'),
+                                )
+
+                        if contextual_attempt >= retry_attempts or not _stream_retryable(full_output()):
+                            await record_stream_error(
+                                retry_error,
+                                saved_retry_cursor,
+                                diagnostic_retry_cursor,
+                            )
+                            return False
+
+                        contextual_attempt += 1
+                        retry_form_data = await prepare_contextual_stream_retry(
+                            retry_error,
+                            contextual_attempt,
+                            retry_attempts,
+                            base_form_data,
+                        )
+                        # From here on, a no-cursor failure belongs to the new
+                        # contextual response. Keep the original cursor for
+                        # diagnostics/final persistence, but never use it as
+                        # a background-resume target for the replacement response.
+                        if saved_retry_cursor:
+                            diagnostic_retry_cursor = dict(saved_retry_cursor)
+                            saved_retry_cursor.clear()
 
                         if CHAT_RESPONSE_STREAM_RETRY_DELAY > 0:
                             await asyncio.sleep(CHAT_RESPONSE_STREAM_RETRY_DELAY)
-
-                        retry_form_data = copy.deepcopy(base_form_data)
-                        retry_form_data['stream'] = True
-                        retry_form_data['metadata'] = metadata
 
                         retry_response = await generate_chat_completion(
                             request,
                             retry_form_data,
                             user,
+                            bypass_system_prompt=bypass_system_prompt,
                         )
 
                         if not isinstance(retry_response, StreamingResponse):
@@ -5078,14 +5731,18 @@ async def streaming_chat_response_handler(response, ctx):
                                     'code': 'stream_retry_non_streaming_response',
                                     'message': 'Upstream retry returned a non-streaming response.',
                                     'type': 'upstream_error',
-                                }
+                                },
+                                saved_retry_cursor,
+                                diagnostic_retry_cursor,
                             )
-                            return
+                            return False
 
                         current_response = retry_response
                         current_form_data = retry_form_data
 
-                await stream_with_retries(response, form_data)
+                stream_completed = await stream_with_retries(response, form_data)
+                if not stream_completed:
+                    return
 
                 tool_call_retries = 0
                 tool_call_sources = []  # Track citation sources from tool results
@@ -5476,9 +6133,14 @@ async def streaming_chat_response_handler(response, ctx):
                                 if not msg_parts or (len(msg_parts) == 1 and not msg_parts[0].get('text', '').strip()):
                                     prior_output.pop()
                             output = []
-                            await stream_body_handler(res, new_form_data)
-                            output[:0] = prior_output
-                            prior_output = []
+                            stream_completed = await stream_with_retries(
+                                res,
+                                new_form_data,
+                                bypass_system_prompt=True,
+                                contextual_base_messages=form_data['messages'],
+                            )
+                            if not stream_completed:
+                                return
                         else:
                             break
                     except Exception as e:
@@ -5649,7 +6311,14 @@ async def streaming_chat_response_handler(response, ctx):
                             )
 
                             if isinstance(res, StreamingResponse):
-                                await stream_body_handler(res, new_form_data)
+                                stream_completed = await stream_with_retries(
+                                    res,
+                                    new_form_data,
+                                    bypass_system_prompt=True,
+                                    contextual_base_messages=form_data['messages'],
+                                )
+                                if not stream_completed:
+                                    return
                             else:
                                 break
                         except Exception as e:

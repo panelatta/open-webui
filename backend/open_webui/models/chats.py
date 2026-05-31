@@ -36,6 +36,13 @@ from sqlalchemy import (
 
 log = logging.getLogger(__name__)
 
+RESPONSE_CURSOR_KEYS = (
+    'response_id',
+    'response_sequence_number',
+    'response_route_idx',
+    'response_route_url',
+)
+
 
 class Chat(Base):
     __tablename__ = 'chat'
@@ -502,18 +509,38 @@ class ChatTable:
 
         if messages_map is not None:
             unresolved_ids = self.get_unresolved_parent_ids(messages_map)
-            if not unresolved_ids:
+            needs_cursor_merge = any(
+                msg.get('role') == 'assistant'
+                and (msg.get('done') is False or msg.get('error'))
+                and any(msg.get(key) is None for key in RESPONSE_CURSOR_KEYS)
+                for msg in messages_map.values()
+            )
+
+            if not unresolved_ids and not needs_cursor_merge:
                 return messages_map
 
-            # Graph has gaps — enrich from the legacy embedded history.
-            log.info(
-                'Chat %s: %d unresolved parent reference(s) in chat_message — enriching from legacy history',
-                id,
-                len(unresolved_ids),
-            )
+            if unresolved_ids:
+                # Graph has gaps — enrich from the legacy embedded history.
+                log.info(
+                    'Chat %s: %d unresolved parent reference(s) in chat_message — enriching from legacy history',
+                    id,
+                    len(unresolved_ids),
+                )
             chat = await self.get_chat_by_id(id)
             if chat:
                 history_messages = chat.chat.get('history', {}).get('messages', {}) or {}
+
+                if needs_cursor_merge:
+                    for message_id, message in messages_map.items():
+                        legacy_message = history_messages.get(message_id)
+                        if not isinstance(legacy_message, dict):
+                            continue
+
+                        for key in RESPONSE_CURSOR_KEYS:
+                            value = legacy_message.get(key)
+                            if value is not None and message.get(key) is None:
+                                message[key] = value
+
                 missing_messages = {
                     message_id: history_messages[message_id]
                     for message_id in unresolved_ids

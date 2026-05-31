@@ -45,6 +45,9 @@ from open_webui.env import (
     FORWARD_SESSION_INFO_HEADER_CHAT_ID,
     BYPASS_MODEL_ACCESS_CONTROL,
     ENABLE_OPENAI_API_PASSTHROUGH,
+    ENABLE_RESPONSES_API_BACKGROUND_RESUME,
+    RESPONSES_API_BACKGROUND_RESUME_MODEL_ALLOWLIST,
+    RESPONSES_API_BACKGROUND_RESUME_BASE_URL_ALLOWLIST,
 )
 from open_webui.models.users import UserModel
 
@@ -1333,6 +1336,52 @@ def _normalize_stored_item(item: dict) -> dict:
     return {k: v for k, v in item.items() if k in allowed}
 
 
+def _responses_background_resume_model_ids(*candidates) -> list[str]:
+    model_ids = []
+
+    def add(candidate):
+        if isinstance(candidate, (list, tuple, set)):
+            for item in candidate:
+                add(item)
+            return
+
+        if not candidate:
+            return
+
+        candidate = str(candidate)
+        if candidate and candidate not in model_ids:
+            model_ids.append(candidate)
+
+    for candidate in candidates:
+        add(candidate)
+
+    return model_ids
+
+
+def responses_background_resume_enabled(model_id: str | list | tuple | set, url: str, api_config: dict) -> bool:
+    if not ENABLE_RESPONSES_API_BACKGROUND_RESUME:
+        return False
+
+    model_ids = _responses_background_resume_model_ids(model_id)
+
+    # Azure retrieve/resume path support varies by deployment. Require an
+    # explicit per-route opt-in instead of enabling through broad allowlists.
+    if api_config.get('azure', False) and api_config.get('responses_background_resume') is not True:
+        return False
+
+    if api_config.get('responses_background_resume') is True:
+        return True
+
+    if any(candidate in RESPONSES_API_BACKGROUND_RESUME_MODEL_ALLOWLIST for candidate in model_ids):
+        return True
+
+    normalized_url = (url or '').rstrip('/')
+    if normalized_url and normalized_url in RESPONSES_API_BACKGROUND_RESUME_BASE_URL_ALLOWLIST:
+        return True
+
+    return False
+
+
 def convert_to_responses_payload(payload: dict) -> dict:
     """
     Convert Chat Completions payload to Responses API format.
@@ -1669,6 +1718,11 @@ async def generate_chat_completion(
 
     url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
     key = request.app.state.config.OPENAI_API_KEYS[idx]
+    background_resume_model_ids = _responses_background_resume_model_ids(
+        form_data.get('model'),
+        getattr(model_info, 'base_model_id', None) if model_info else None,
+        model_id,
+    )
 
     # Check if model is a reasoning model that needs special handling
     if is_openai_new_model(payload['model']):
@@ -1725,6 +1779,16 @@ async def generate_chat_completion(
     def build_openai_request(base_payload: dict) -> tuple[str, str]:
         outbound_payload = copy.deepcopy(base_payload)
 
+        def apply_background_resume_flags(payload: dict) -> dict:
+            if payload.get('stream') and responses_background_resume_enabled(
+                [*background_resume_model_ids, payload.get('model', '')],
+                url,
+                api_config,
+            ):
+                payload['background'] = True
+                payload['store'] = True
+            return payload
+
         if not is_responses and "messages" in outbound_payload:
             for message in outbound_payload["messages"]:
                 if message.get("role") == "tool" and isinstance(message.get("content"), list):
@@ -1738,6 +1802,7 @@ async def generate_chat_completion(
             if is_azure_v1:
                 if is_responses:
                     outbound_payload = convert_to_responses_payload(outbound_payload)
+                    outbound_payload = apply_background_resume_flags(outbound_payload)
                     request_url_local = f'{url.rstrip("/")}/responses'
                 else:
                     request_url_local = f'{url.rstrip("/")}/chat/completions'
@@ -1748,6 +1813,7 @@ async def generate_chat_completion(
 
                 if is_responses:
                     outbound_payload = convert_to_responses_payload(outbound_payload)
+                    outbound_payload = apply_background_resume_flags(outbound_payload)
                     request_url_local = (
                         f"{request_url_local}/responses?api-version={api_version}"
                     )
@@ -1758,6 +1824,7 @@ async def generate_chat_completion(
         else:
             if is_responses:
                 outbound_payload = convert_to_responses_payload(outbound_payload)
+                outbound_payload = apply_background_resume_flags(outbound_payload)
                 request_url_local = f"{url}/responses"
             else:
                 request_url_local = f"{url}/chat/completions"
@@ -1814,10 +1881,14 @@ async def generate_chat_completion(
 
                 streaming = True
                 content_handler = stream_sse_lines if is_responses else stream_chunks_handler
+                response_headers = _clean_proxy_headers(r.headers)
+                if is_responses:
+                    response_headers['x-openwebui-openai-url-idx'] = str(idx)
+                    response_headers['x-openwebui-openai-base-url'] = url
                 return StreamingResponse(
                     stream_wrapper(r, content_handler=content_handler),
                     status_code=r.status,
-                    headers=_clean_proxy_headers(r.headers),
+                    headers=response_headers,
                 )
 
             try:
@@ -1962,6 +2033,7 @@ class ResponsesForm(BaseModel):
     input: Optional[list | str] = None
     instructions: Optional[str] = None
     stream: Optional[bool] = None
+    background: Optional[bool] = None
     temperature: Optional[float] = None
     max_output_tokens: Optional[int] = None
     top_p: Optional[float] = None
@@ -1975,10 +2047,241 @@ class ResponsesForm(BaseModel):
     previous_response_id: Optional[str] = None
 
 
+async def resolve_openai_route(
+    request: Request,
+    model_id: str | None,
+    user,
+    route_idx: int | None = None,
+):
+    if route_idx is not None:
+        urls = request.app.state.config.OPENAI_API_BASE_URLS
+        if route_idx < 0 or route_idx >= len(urls):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Stored response route is invalid; cannot resume response stream.',
+            )
+        idx = route_idx
+    else:
+        if not model_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Model or stored response route is required to resolve upstream provider.',
+            )
+
+        models = request.app.state.OPENAI_MODELS
+        if not models or model_id not in models:
+            await get_all_models(request, user=user)
+            models = request.app.state.OPENAI_MODELS
+
+        if model_id not in models:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Model route not found; refusing to default to upstream index 0.',
+            )
+
+        idx = models[model_id]['urlIdx']
+
+    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+    key = request.app.state.config.OPENAI_API_KEYS[idx]
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
+        str(idx),
+        request.app.state.config.OPENAI_API_CONFIGS.get(url, {}),
+    )
+
+    return idx, url, key, api_config
+
+
+async def resume_response_stream(
+    request: Request,
+    model_id: str,
+    response_id: str,
+    starting_after: int | None,
+    route_idx: int | None,
+    user,
+):
+    if not ENABLE_RESPONSES_API_BACKGROUND_RESUME:
+        return None
+
+    model_info = await Models.get_model_by_id(model_id)
+    await check_model_access(user, model_info, BYPASS_MODEL_ACCESS_CONTROL)
+
+    idx, url, key, api_config = await resolve_openai_route(
+        request,
+        model_id=model_id,
+        user=user,
+        route_idx=route_idx,
+    )
+
+    if not responses_background_resume_enabled(
+        _responses_background_resume_model_ids(
+            model_id,
+            getattr(model_info, 'base_model_id', None) if model_info else None,
+        ),
+        url,
+        api_config,
+    ):
+        log.info('Responses background resume is not enabled for model=%s url=%s', model_id, url)
+        return None
+
+    headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
+
+    if api_config.get('azure', False):
+        log.info('Responses background resume is disabled for Azure routes in this patch')
+        return None
+
+    params = {'stream': 'true'}
+    if starting_after is not None:
+        params['starting_after'] = str(starting_after)
+
+    request_url = f'{url}/responses/{quote(response_id, safe="")}'
+
+    r = None
+    streaming = False
+    try:
+        session = await get_session()
+        r = await session.request(
+            method='GET',
+            url=request_url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+        )
+
+        if 'text/event-stream' in r.headers.get('Content-Type', '') and r.status < 400:
+            streaming = True
+            response_headers = _clean_proxy_headers(r.headers)
+            response_headers['x-openwebui-openai-url-idx'] = str(idx)
+            response_headers['x-openwebui-openai-base-url'] = url
+            return StreamingResponse(
+                stream_wrapper(r, content_handler=stream_sse_lines),
+                status_code=r.status,
+                headers=response_headers,
+            )
+
+        try:
+            response_data = await r.json()
+        except Exception:
+            response_data = await r.text()
+
+        log.info(
+            'Responses background resume returned non-stream response '
+            '(status=%s, response_id=%s): %s',
+            r.status,
+            response_id,
+            summarize_response_debug_value(response_data),
+        )
+
+        return JSONResponse(status_code=r.status, content=response_data)
+    except Exception:
+        log.exception('Responses background resume failed for %s', response_id)
+        return None
+    finally:
+        if not streaming:
+            await cleanup_response(r)
+
+
+@router.get('/responses/{response_id}')
+async def get_response(
+    response_id: str,
+    request: Request,
+    model: str,
+    route_idx: Optional[int] = None,
+    stream: Optional[bool] = None,
+    starting_after: Optional[int] = None,
+    user=Depends(get_verified_user),
+):
+    """
+    Retrieve or resume a background Responses API response.
+
+    Prefer route_idx from stored message metadata when available. The model is
+    still required for access control and as a route fallback for manual calls.
+    """
+    model_info = await Models.get_model_by_id(model)
+    await check_model_access(user, model_info, BYPASS_MODEL_ACCESS_CONTROL)
+
+    idx, url, key, api_config = await resolve_openai_route(
+        request,
+        model_id=model,
+        user=user,
+        route_idx=route_idx,
+    )
+
+    if not responses_background_resume_enabled(
+        _responses_background_resume_model_ids(
+            model,
+            getattr(model_info, 'base_model_id', None) if model_info else None,
+        ),
+        url,
+        api_config,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Responses background retrieve/resume is not enabled for this provider.',
+        )
+
+    headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
+
+    if api_config.get('azure', False):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Responses background retrieve/resume is not implemented for Azure routes.',
+        )
+
+    params = {}
+    if stream is not None:
+        params['stream'] = 'true' if stream else 'false'
+    if starting_after is not None:
+        params['starting_after'] = str(starting_after)
+
+    request_url = f'{url}/responses/{quote(response_id, safe="")}'
+
+    r = None
+    streaming = False
+    try:
+        session = await get_session()
+        r = await session.request(
+            method='GET',
+            url=request_url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+        )
+
+        if 'text/event-stream' in r.headers.get('Content-Type', ''):
+            streaming = True
+            response_headers = _clean_proxy_headers(r.headers)
+            response_headers['x-openwebui-openai-url-idx'] = str(idx)
+            response_headers['x-openwebui-openai-base-url'] = url
+            return StreamingResponse(
+                stream_wrapper(r, content_handler=stream_sse_lines),
+                status_code=r.status,
+                headers=response_headers,
+            )
+
+        try:
+            response_data = await r.json()
+        except Exception:
+            response_data = await r.text()
+
+        if r.status >= 400:
+            if isinstance(response_data, (dict, list)):
+                return JSONResponse(status_code=r.status, content=response_data)
+            return PlainTextResponse(status_code=r.status, content=response_data)
+
+        return response_data
+    finally:
+        if not streaming:
+            await cleanup_response(r)
+
+
 @router.post('/responses')
 async def responses(
     request: Request,
-    form_data: dict,
+    form_data: ResponsesForm,
     user=Depends(get_verified_user),
 ):
     """
@@ -1991,31 +2294,39 @@ async def responses(
     """
     payload = form_data.model_dump(exclude_none=True)
 
-    idx = 0
     model_id = form_data.model
 
     # Enforce per-model access control
-    await check_model_access(user, await Models.get_model_by_id(model_id), BYPASS_MODEL_ACCESS_CONTROL)
+    model_info = await Models.get_model_by_id(model_id)
+    await check_model_access(user, model_info, BYPASS_MODEL_ACCESS_CONTROL)
+
+    idx, url, key, api_config = await resolve_openai_route(
+        request,
+        model_id=model_id,
+        user=user,
+    )
+
+    if payload.get('stream') and responses_background_resume_enabled(
+        _responses_background_resume_model_ids(
+            model_id,
+            getattr(model_info, 'base_model_id', None) if model_info else None,
+            payload.get('model', ''),
+        ),
+        url,
+        api_config,
+    ):
+        payload['background'] = True
+        payload['store'] = True
 
     body = json.dumps(payload)
 
-    if model_id:
-        models = request.app.state.OPENAI_MODELS
-        if not models or model_id not in models:
-            await get_all_models(request, user=user)
-            models = request.app.state.OPENAI_MODELS
-        if model_id in models:
-            idx = models[model_id]['urlIdx']
-
-    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
-    key = request.app.state.config.OPENAI_API_KEYS[idx]
-    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
-        str(idx),
-        request.app.state.config.OPENAI_API_CONFIGS.get(url, {}),  # Legacy support
-    )
-
     r = None
     streaming = False
+    debug_info = {
+        'model': model_id,
+        'url_idx': idx,
+        'url': url,
+    }
 
     try:
         headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
@@ -2051,10 +2362,13 @@ async def responses(
         # Check if response is SSE
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
             streaming = True
+            response_headers = _clean_proxy_headers(r.headers)
+            response_headers['x-openwebui-openai-url-idx'] = str(idx)
+            response_headers['x-openwebui-openai-base-url'] = url
             return StreamingResponse(
-                stream_wrapper(r),
+                stream_wrapper(r, content_handler=stream_sse_lines),
                 status_code=r.status,
-                headers=_clean_proxy_headers(r.headers),
+                headers=response_headers,
             )
         else:
             try:

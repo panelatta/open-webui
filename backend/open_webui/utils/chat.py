@@ -25,6 +25,7 @@ from open_webui.functions import generate_function_chat_completion
 
 from open_webui.routers.openai import (
     generate_chat_completion as generate_openai_chat_completion,
+    resume_response_stream as resume_openai_response_stream,
 )
 
 from open_webui.routers.ollama import (
@@ -264,6 +265,7 @@ async def generate_chat_completion(
                 return StreamingResponse(
                     stream_wrapper(response.body_iterator),
                     media_type='text/event-stream',
+                    headers=dict(response.headers),
                     background=response.background,
                 )
             else:
@@ -308,6 +310,38 @@ async def generate_chat_completion(
                 user=user,
                 bypass_system_prompt=bypass_system_prompt,
             )
+
+
+async def resume_response_stream(
+    request: Request,
+    model_id: str,
+    response_id: str,
+    starting_after: int | None,
+    route_idx: int | None,
+    user: Any,
+):
+    if getattr(request.state, 'direct', False):
+        return None
+
+    if not request.app.state.MODELS:
+        await get_all_models(request, user=user)
+
+    models = request.app.state.MODELS
+    if model_id not in models:
+        return None
+
+    model = models[model_id]
+    if model.get('pipe') or model.get('owned_by') == 'ollama':
+        return None
+
+    return await resume_openai_response_stream(
+        request=request,
+        model_id=model_id,
+        response_id=response_id,
+        starting_after=starting_after,
+        route_idx=route_idx,
+        user=user,
+    )
 
 
 chat_completion = generate_chat_completion

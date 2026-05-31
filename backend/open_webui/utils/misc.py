@@ -129,6 +129,62 @@ def get_content_from_message(message: dict) -> Optional[str]:
     return None
 
 
+def convert_web_search_output_to_resume_message(output: list) -> dict | None:
+    if not output or not isinstance(output, list):
+        return None
+
+    lines = []
+
+    for item in output:
+        if not isinstance(item, dict) or item.get('type') != 'web_search_call':
+            continue
+        if item.get('status') != 'completed':
+            continue
+
+        action = item.get('action') or {}
+        action_type = action.get('type') or 'web_search'
+
+        queries = []
+        query = action.get('query')
+        if query:
+            queries.append(query)
+        for value in action.get('queries') or []:
+            if value and value not in queries:
+                queries.append(value)
+
+        url = action.get('url')
+        sources = action.get('sources') or []
+
+        if queries:
+            lines.append(f'- completed {action_type}: ' + '; '.join(str(q) for q in queries))
+        elif url:
+            lines.append(f'- completed {action_type}: {url}')
+        else:
+            lines.append(f'- completed {action_type}')
+
+        for source in sources[:8]:
+            if not isinstance(source, dict):
+                continue
+            source_url = source.get('url') or source.get('link')
+            source_title = source.get('title') or source_url
+            if source_url:
+                lines.append(f'  - source: {source_title} ({source_url})')
+
+    if not lines:
+        return None
+
+    return {
+        'role': 'assistant',
+        'content': (
+            '<previous_hosted_web_search_context>\n'
+            'The interrupted previous attempt completed these hosted web search steps. '
+            'Use this as progress context and avoid repeating the same searches unless needed.\n'
+            + '\n'.join(lines)
+            + '\n</previous_hosted_web_search_context>'
+        ),
+    }
+
+
 def convert_output_to_messages(
     output: list,
     raw: bool = False,

@@ -768,6 +768,46 @@ else:
         CHAT_RESPONSE_STREAM_RETRY_VISIBLE_CHAR_LIMIT = 1200
 
 
+# WARNING: Background Responses store server-side response data so streams can
+# be resumed with starting_after. Enable only for providers that support
+# GET /v1/responses/{response_id}?stream=true&starting_after=N and where this
+# storage behavior is acceptable.
+ENABLE_RESPONSES_API_BACKGROUND_RESUME = (
+    os.environ.get('ENABLE_RESPONSES_API_BACKGROUND_RESUME', 'False').lower() == 'true'
+)
+
+RESPONSES_API_BACKGROUND_RESUME_MODEL_ALLOWLIST = {
+    item.strip()
+    for item in os.environ.get('RESPONSES_API_BACKGROUND_RESUME_MODEL_ALLOWLIST', '').split(',')
+    if item.strip()
+}
+
+RESPONSES_API_BACKGROUND_RESUME_BASE_URL_ALLOWLIST = {
+    item.strip().rstrip('/')
+    for item in os.environ.get('RESPONSES_API_BACKGROUND_RESUME_BASE_URL_ALLOWLIST', '').split(',')
+    if item.strip()
+}
+
+RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS = os.environ.get(
+    'RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS',
+    '2',
+)
+
+if RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS == '':
+    RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS = 2
+else:
+    try:
+        RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS = int(RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS)
+    except Exception:
+        RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS = 2
+
+RESPONSES_API_CONTEXTUAL_RETRY_TOOL_ALLOWLIST = {
+    item.strip()
+    for item in os.environ.get('RESPONSES_API_CONTEXTUAL_RETRY_TOOL_ALLOWLIST', '').split(',')
+    if item.strip()
+}
+
+
 # WARNING: Experimental. Only enable if your upstream Responses API endpoint
 # supports stateful sessions (i.e. server-side response storage with
 # previous_response_id anchoring). Most proxies and third-party endpoints
