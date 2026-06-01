@@ -77,6 +77,7 @@ from open_webui.retrieval.utils import get_sources_from_items
 
 from open_webui.utils.sanitize import sanitize_code
 from open_webui.utils.chat import generate_chat_completion, resume_response_stream
+from open_webui.utils.post_chat_memory import run_post_chat_memory_extractor
 from open_webui.utils.task import (
     get_task_model_id,
     rag_template,
@@ -4007,6 +4008,17 @@ async def background_tasks_handler(ctx):
                             )
                         except Exception as e:
                             pass
+
+        try:
+            await run_post_chat_memory_extractor(
+                request=request,
+                user=user,
+                model=ctx.get('model') or {},
+                metadata=metadata,
+                messages=messages,
+            )
+        except Exception as e:
+            log.debug(f'Post-chat memory extractor error: {e}')
 
 
 async def outlet_filter_handler(ctx):
