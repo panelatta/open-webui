@@ -2,6 +2,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 OPEN_WEBUI_DIR = BACKEND_DIR / 'open_webui'
@@ -18,3 +20,8 @@ os.environ.setdefault('AZURE_STORAGE_CONTAINER_NAME', 'open-webui-test')
 os.environ.setdefault('AZURE_STORAGE_KEY', 'open-webui-test-key')
 if not os.environ.get('WEBUI_SECRET_KEY'):
     os.environ['WEBUI_SECRET_KEY'] = 'open-webui-test-secret'
+
+
+@pytest.fixture
+def anyio_backend():
+    return 'asyncio'

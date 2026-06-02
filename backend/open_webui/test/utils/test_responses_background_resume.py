@@ -240,7 +240,7 @@ def test_background_resume_azure_requires_explicit_route_opt_in(monkeypatch):
     )
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resolve_openai_route_rejects_missing_model_without_defaulting(monkeypatch):
     request = SimpleNamespace(
         app=SimpleNamespace(
@@ -267,7 +267,7 @@ async def test_resolve_openai_route_rejects_missing_model_without_defaulting(mon
     assert 'refusing to default to upstream index 0' in exc_info.value.detail
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resolve_openai_route_uses_stored_route_idx():
     request = SimpleNamespace(
         app=SimpleNamespace(
@@ -295,7 +295,7 @@ async def test_resolve_openai_route_uses_stored_route_idx():
     assert api_config == {'responses_background_resume': True}
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_resolve_openai_route_rejects_invalid_stored_route_idx():
     request = SimpleNamespace(
         app=SimpleNamespace(
@@ -322,7 +322,7 @@ async def test_resolve_openai_route_rejects_invalid_stored_route_idx():
     assert 'Stored response route is invalid' in exc_info.value.detail
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_stream_retries_resume_background_before_contextual_retry(monkeypatch):
     monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_BACKGROUND_RESUME', True)
     monkeypatch.setattr(middleware, 'RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS', 1)
@@ -370,7 +370,7 @@ async def test_stream_retries_resume_background_before_contextual_retry(monkeypa
     assert not any(event.get('data', {}).get('error') for event in events)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_stream_retries_fall_back_after_non_stream_background_resume(monkeypatch):
     monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_BACKGROUND_RESUME', True)
     monkeypatch.setattr(middleware, 'RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS', 1)
@@ -420,7 +420,7 @@ async def test_stream_retries_fall_back_after_non_stream_background_resume(monke
     assert not any(event.get('data', {}).get('error') for event in events)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_stream_retries_missing_route_idx_fails_closed_without_resume(monkeypatch):
     monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_BACKGROUND_RESUME', True)
     monkeypatch.setattr(middleware, 'RESPONSES_API_BACKGROUND_RESUME_ATTEMPTS', 1)
@@ -454,7 +454,7 @@ async def test_stream_retries_missing_route_idx_fails_closed_without_resume(monk
     assert events[-1]['data']['done'] is False
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_empty_responses_stream_eof_persists_done_false(monkeypatch):
     monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_BACKGROUND_RESUME', False)
     monkeypatch.setattr(middleware, 'CHAT_RESPONSE_STREAM_RETRY_ATTEMPTS', 0)
@@ -470,7 +470,7 @@ async def test_empty_responses_stream_eof_persists_done_false(monkeypatch):
     assert events[-1]['data']['done'] is False
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_tool_followup_contextual_retry_sanitizes_base_messages_and_preserves_bypass(monkeypatch):
     monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_BACKGROUND_RESUME', False)
     monkeypatch.setattr(middleware, 'CHAT_RESPONSE_STREAM_RETRY_ATTEMPTS', 1)
@@ -629,7 +629,7 @@ def test_contextual_retry_cleaning_drops_unallowlisted_completed_tool_items(monk
     assert all('secret' not in json.dumps(item) for item in cleaned)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_hosted_tool_items_are_dropped_before_contextual_retry(monkeypatch):
     monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_BACKGROUND_RESUME', False)
     monkeypatch.setattr(middleware, 'CHAT_RESPONSE_STREAM_RETRY_ATTEMPTS', 1)
@@ -684,7 +684,7 @@ async def test_hosted_tool_items_are_dropped_before_contextual_retry(monkeypatch
     assert not any(event.get('data', {}).get('error') for event in events)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_code_interpreter_followup_stream_error_does_not_run_contextual_retry(monkeypatch):
     monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_BACKGROUND_RESUME', False)
     monkeypatch.setattr(middleware, 'CHAT_RESPONSE_STREAM_RETRY_ATTEMPTS', 1)
