@@ -1379,11 +1379,11 @@ def convert_to_responses_payload(payload: dict) -> dict:
             input_items.extend(_normalize_stored_item(item) for item in stored_output)
             continue
 
-        if role == 'system':
+        if role in ('system', 'developer'):
             if isinstance(content, str):
                 system_content = content
             elif isinstance(content, list):
-                system_content = '\n'.join(p.get('text', '') for p in content if p.get('type') == 'text')
+                system_content = '\n'.join(p.get('text', '') for p in content if p.get('type') in {'text', 'input_text'})
             continue
 
         # Handle assistant messages with tool_calls (from convert_output_to_messages)
