@@ -155,6 +155,99 @@ def openai_reasoning_model_handler(payload):
     return payload
 
 
+def _disabled_response_tool_types(api_config: dict | None) -> set[str]:
+    if not isinstance(api_config, dict):
+        return set()
+
+    raw = (
+        api_config.get("disabled_response_tools")
+        or api_config.get("disabled_responses_tools")
+        or api_config.get("unsupported_response_tools")
+    )
+    if not raw:
+        return set()
+
+    if isinstance(raw, str):
+        values = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        return set()
+
+    return {
+        value.strip()
+        for value in values
+        if isinstance(value, str) and value.strip()
+    }
+
+
+def _response_tool_type(tool: dict) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    tool_type = tool.get("type")
+    return tool_type.strip() if isinstance(tool_type, str) else ""
+
+
+def _response_tool_choice_type(tool_choice) -> str:
+    if not isinstance(tool_choice, dict):
+        return ""
+    tool_type = tool_choice.get("type")
+    return tool_type.strip() if isinstance(tool_type, str) else ""
+
+
+def _response_include_references_tool(include_item, tool_type: str) -> bool:
+    if not isinstance(include_item, str) or not tool_type:
+        return False
+    include_item = include_item.strip()
+    return (
+        include_item == tool_type
+        or include_item.startswith(f"{tool_type}.")
+        or include_item.startswith(f"{tool_type}_call.")
+    )
+
+
+def filter_disabled_response_tools(payload: dict, api_config: dict | None) -> dict:
+    disabled_tool_types = _disabled_response_tool_types(api_config)
+    if not disabled_tool_types:
+        return payload
+
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        filtered_tools = [
+            tool
+            for tool in tools
+            if _response_tool_type(tool) not in disabled_tool_types
+        ]
+        if filtered_tools:
+            payload["tools"] = filtered_tools
+        else:
+            payload.pop("tools", None)
+
+    include = payload.get("include")
+    if isinstance(include, list):
+        filtered_include = [
+            item
+            for item in include
+            if not any(
+                _response_include_references_tool(item, tool_type)
+                for tool_type in disabled_tool_types
+            )
+        ]
+        if filtered_include:
+            payload["include"] = filtered_include
+        else:
+            payload.pop("include", None)
+
+    if (
+        "tools" not in payload
+        or _response_tool_choice_type(payload.get("tool_choice"))
+        in disabled_tool_types
+    ):
+        payload.pop("tool_choice", None)
+
+    return payload
+
+
 def merge_response_tools(
     existing_tools: Optional[list], configured_tools: Optional[list]
 ) -> Optional[list]:
@@ -1766,6 +1859,12 @@ async def generate_chat_completion(
                 payload['store'] = True
             return payload
 
+        def prepare_responses_payload(payload: dict) -> dict:
+            payload = convert_to_responses_payload(payload)
+            payload = apply_background_resume_flags(payload)
+            payload = filter_disabled_response_tools(payload, api_config)
+            return payload
+
         if not is_responses and "messages" in outbound_payload:
             for message in outbound_payload["messages"]:
                 if message.get("role") == "tool" and isinstance(message.get("content"), list):
@@ -1778,8 +1877,7 @@ async def generate_chat_completion(
         if is_azure_route:
             if is_azure_v1:
                 if is_responses:
-                    outbound_payload = convert_to_responses_payload(outbound_payload)
-                    outbound_payload = apply_background_resume_flags(outbound_payload)
+                    outbound_payload = prepare_responses_payload(outbound_payload)
                     request_url_local = f'{url.rstrip("/")}/responses'
                 else:
                     request_url_local = f'{url.rstrip("/")}/chat/completions'
@@ -1789,8 +1887,7 @@ async def generate_chat_completion(
                 )
 
                 if is_responses:
-                    outbound_payload = convert_to_responses_payload(outbound_payload)
-                    outbound_payload = apply_background_resume_flags(outbound_payload)
+                    outbound_payload = prepare_responses_payload(outbound_payload)
                     request_url_local = (
                         f"{request_url_local}/responses?api-version={api_version}"
                     )
@@ -1800,8 +1897,7 @@ async def generate_chat_completion(
                     )
         else:
             if is_responses:
-                outbound_payload = convert_to_responses_payload(outbound_payload)
-                outbound_payload = apply_background_resume_flags(outbound_payload)
+                outbound_payload = prepare_responses_payload(outbound_payload)
                 request_url_local = f"{url}/responses"
             else:
                 request_url_local = f"{url}/chat/completions"
