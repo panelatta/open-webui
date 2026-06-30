@@ -1094,6 +1094,51 @@ def finalize_output_items(output: list, ended_at: float | None = None) -> list:
     return output
 
 
+def merge_responses_output_runtime_metadata(
+    final_output: list,
+    current_output: list,
+) -> list:
+    """Preserve local streaming metadata when Responses final output arrives.
+
+    The Responses API final response.output contains the authoritative item
+    content, but it does not include Open WebUI runtime fields such as
+    started_at. Without merging those fields back in, completed reasoning
+    blocks render as a zero-second thought even when the stream ran for minutes.
+    """
+    previous_by_id = {
+        item.get("id"): item
+        for item in current_output or []
+        if isinstance(item, dict) and item.get("id")
+    }
+
+    merged_output = []
+    for idx, item in enumerate(final_output or []):
+        if not isinstance(item, dict):
+            merged_output.append(item)
+            continue
+
+        merged_item = copy.deepcopy(item)
+        previous_item = previous_by_id.get(item.get("id"))
+        if previous_item is None and idx < len(current_output or []):
+            candidate = current_output[idx]
+            if isinstance(candidate, dict) and candidate.get("type") == item.get("type"):
+                previous_item = candidate
+
+        if isinstance(previous_item, dict):
+            for key in ("started_at", "ended_at", "duration"):
+                if merged_item.get(key) is None and previous_item.get(key) is not None:
+                    merged_item[key] = previous_item[key]
+
+            if merged_item.get("type") == "reasoning":
+                for key in ("summary", "content"):
+                    if not merged_item.get(key) and previous_item.get(key):
+                        merged_item[key] = copy.deepcopy(previous_item[key])
+
+        merged_output.append(merged_item)
+
+    return merged_output
+
+
 RESPONSES_TOOL_EVENT_TYPES = {
     'web_search_call',
     'file_search_call',
@@ -1606,13 +1651,12 @@ def handle_responses_streaming_event(
         response_data = data.get('response', {})
         final_output = response_data.get('output')
 
-        new_output = final_output if final_output is not None else current_output
+        if isinstance(final_output, list):
+            new_output = merge_responses_output_runtime_metadata(final_output, current_output)
+        else:
+            new_output = copy.deepcopy(current_output)
 
-        # Ensure reasoning items are marked as completed in the final output
-        if new_output:
-            for item in new_output:
-                if item.get('type') == 'reasoning' and item.get('status') != 'completed':
-                    item['status'] = 'completed'
+        new_output = finalize_output_items(new_output)
 
         return new_output, {
             'usage': response_data.get('usage'),

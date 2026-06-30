@@ -70,6 +70,64 @@ def test_output_item_added_replaces_reasoning_placeholder():
     assert '_placeholder' not in output[0]
 
 
+def test_response_completed_preserves_reasoning_runtime_metadata(monkeypatch):
+    monkeypatch.setattr('open_webui.utils.middleware.time.time', lambda: 165.2)
+
+    output, metadata = handle_responses_streaming_event(
+        {
+            'type': 'response.completed',
+            'response': {
+                'id': 'resp_123',
+                'output': [
+                    {
+                        'type': 'reasoning',
+                        'id': 'rs_123',
+                        'status': 'completed',
+                        'summary': [
+                            {
+                                'type': 'summary_text',
+                                'text': 'kept thinking',
+                            }
+                        ],
+                    },
+                    {
+                        'type': 'message',
+                        'id': 'msg_123',
+                        'status': 'completed',
+                        'role': 'assistant',
+                        'content': [
+                            {
+                                'type': 'output_text',
+                                'text': 'done',
+                            }
+                        ],
+                    },
+                ],
+                'usage': {'total_tokens': 10},
+            },
+        },
+        [
+            {
+                'type': 'reasoning',
+                'id': 'rs_123',
+                'status': 'in_progress',
+                'summary': [],
+                'content': [],
+                'started_at': 100.0,
+            }
+        ],
+    )
+
+    assert metadata['done'] is True
+    assert output[0]['started_at'] == 100.0
+    assert output[0]['duration'] == 65
+    assert output[0]['status'] == 'completed'
+
+    rendered = serialize_output(output)
+    assert 'duration="65"' in rendered
+    assert 'Thought for 65 seconds' in rendered
+
+
 def test_web_search_completed_event_renders_before_response_completed():
     output, metadata = handle_responses_streaming_event(
         {
