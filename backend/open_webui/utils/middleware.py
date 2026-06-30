@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import base64
 import copy
+import html
 import inspect
 import json
 import logging

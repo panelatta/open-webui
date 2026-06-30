@@ -2087,13 +2087,26 @@ async def resolve_openai_route(
     route_idx: int | None = None,
 ):
     if route_idx is not None:
-        _, urls, _, _ = await get_openai_runtime_config()
+        state_config = getattr(getattr(request.app, 'state', None), 'config', None)
+        if state_config is not None and hasattr(state_config, 'OPENAI_API_BASE_URLS'):
+            urls = list(getattr(state_config, 'OPENAI_API_BASE_URLS', []) or [])
+            keys = list(getattr(state_config, 'OPENAI_API_KEYS', []) or [])
+            api_configs = getattr(state_config, 'OPENAI_API_CONFIGS', {}) or {}
+        else:
+            _, urls, keys, api_configs = await get_openai_runtime_config()
+
         if route_idx < 0 or route_idx >= len(urls):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='Stored response route is invalid; cannot resume response stream.',
             )
         idx = route_idx
+        if len(keys) < len(urls):
+            keys = [*keys, *([''] * (len(urls) - len(keys)))]
+        url = urls[idx]
+        key = keys[idx]
+        api_config = api_configs.get(str(idx), api_configs.get(url, {})) if isinstance(api_configs, dict) else {}
+        return idx, url, key, api_config
     else:
         if not model_id:
             raise HTTPException(
