@@ -16,6 +16,8 @@ log = logging.getLogger(__name__)
 
 MEMORY_CONTEXT_OPEN = '<memory_context>'
 MEMORY_CONTEXT_CLOSE = '</memory_context>'
+DEFAULT_MEMORY_QUERY_MESSAGE_LIMIT = 3
+DEFAULT_MEMORY_QUERY_CHAR_LIMIT = 1200
 
 
 def clean_memory_content(content: str | None) -> str:
@@ -287,27 +289,101 @@ def model_allows_memory(model: dict | None) -> bool:
     return ((model or {}).get('info', {}).get('meta', {}).get('capabilities') or {}).get('memory', True)
 
 
-async def add_memory_context(request, form_data: dict, user, model: dict | None = None):
-    if not model_allows_memory(model):
-        return form_data
+def _positive_int(value, default: int) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
 
-    user_messages = []
-    for message in reversed(form_data.get('messages', [])):
+
+def _truncate_memory_query(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+
+    marker = '\n…\n'
+    if limit <= len(marker):
+        return text[:limit]
+
+    available = limit - len(marker)
+    head = max(1, (available * 2) // 3)
+    tail = available - head
+    return f'{text[:head]}{marker}{text[-tail:]}' if tail else text[:limit]
+
+
+def build_memory_query(
+    messages: list[dict],
+    *,
+    message_limit: int = DEFAULT_MEMORY_QUERY_MESSAGE_LIMIT,
+    char_limit: int = DEFAULT_MEMORY_QUERY_CHAR_LIMIT,
+) -> str:
+    message_limit = _positive_int(message_limit, DEFAULT_MEMORY_QUERY_MESSAGE_LIMIT)
+    char_limit = _positive_int(char_limit, DEFAULT_MEMORY_QUERY_CHAR_LIMIT)
+
+    selected = []
+    remaining = char_limit
+    for message in reversed(messages):
         if message.get('role') != 'user':
             continue
 
         content = get_content_from_message(message)
-        if isinstance(content, str) and content.strip():
-            user_messages.append(content.strip())
+        if not isinstance(content, str) or not content.strip():
+            continue
 
-        if len(user_messages) >= 7:
+        separator_size = 2 if selected else 0
+        available = remaining - separator_size
+        if available <= 0:
             break
 
-    query = '\n\n'.join(reversed(user_messages))[-4000:]
+        content = content.strip()
+        if len(content) > available:
+            content = _truncate_memory_query(content, available) if not selected else content[-available:]
+
+        selected.append(content)
+        remaining -= separator_size + len(content)
+        if len(selected) >= message_limit or remaining <= 0:
+            break
+
+    return '\n\n'.join(reversed(selected))
+
+
+async def _emit_memory_search_status(event_emitter, description: str, *, done: bool, error: bool = False):
+    if event_emitter is None:
+        return
+
+    try:
+        await event_emitter(
+            {
+                'type': 'status',
+                'data': {
+                    'action': 'memory_search',
+                    'description': description,
+                    'done': done,
+                    'error': error,
+                },
+            }
+        )
+    except Exception as e:
+        log.debug(f'Failed to emit memory search status: {e}')
+
+
+async def add_memory_context(request, form_data: dict, user, model: dict | None = None, event_emitter=None):
+    if not model_allows_memory(model):
+        return form_data
+
+    query_config = await Config.get_many('memories.query_message_limit', 'memories.query_char_limit')
+    query = build_memory_query(
+        form_data.get('messages', []),
+        message_limit=query_config.get('memories.query_message_limit', DEFAULT_MEMORY_QUERY_MESSAGE_LIMIT),
+        char_limit=query_config.get('memories.query_char_limit', DEFAULT_MEMORY_QUERY_CHAR_LIMIT),
+    )
     if not query:
         return form_data
 
     all_memories = await Memories.get_memories_by_user_id(user.id)
+    if not all_memories:
+        return form_data
+
+    await _emit_memory_search_status(event_emitter, 'Searching memories', done=False)
     results = None
     try:
         from open_webui.routers.memories import QueryMemoryForm, query_memory
@@ -315,6 +391,14 @@ async def add_memory_context(request, form_data: dict, user, model: dict | None 
         results = await query_memory(request, QueryMemoryForm(content=query, k=8), user)
     except Exception as e:
         log.debug(e)
+        await _emit_memory_search_status(
+            event_emitter,
+            'Memory retrieval unavailable',
+            done=True,
+            error=True,
+        )
+    else:
+        await _emit_memory_search_status(event_emitter, 'Memory retrieval complete', done=True)
 
     sections = {'user': [], 'neighborhood': [], 'context': []}
     seen_ids = set()

@@ -48,6 +48,22 @@
 					})}
 				</div>
 			</div>
+		{:else if status?.action === 'memory_search'}
+			<div class="flex flex-col justify-center -space-y-0.5">
+				<div
+					class="{(done || status?.done) === false
+						? 'shimmer'
+						: ''} text-gray-500 dark:text-gray-500 text-base line-clamp-1 text-wrap"
+				>
+					{#if status?.error}
+						{$i18n.t('Memory retrieval unavailable')}
+					{:else if status?.done}
+						{$i18n.t('Memory retrieval complete')}
+					{:else}
+						{$i18n.t('Searching memories')}
+					{/if}
+				</div>
+			</div>
 		{:else if status?.action === 'web_search_queries_generated' && status?.queries}
 			<div class="flex flex-col justify-center -space-y-0.5">
 				<div

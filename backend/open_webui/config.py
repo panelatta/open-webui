@@ -419,6 +419,8 @@ ENABLE_MEMORY_BACKGROUND_REVIEW = os.getenv('ENABLE_MEMORY_BACKGROUND_REVIEW', '
 MEMORIES_REVIEW_INTERVAL_TURNS = int(os.getenv('MEMORIES_REVIEW_INTERVAL_TURNS', '10'))
 MEMORIES_USER_CHAR_LIMIT = int(os.getenv('MEMORIES_USER_CHAR_LIMIT', '2000'))
 MEMORIES_CONTEXT_CHAR_LIMIT = int(os.getenv('MEMORIES_CONTEXT_CHAR_LIMIT', '2000'))
+MEMORIES_QUERY_MESSAGE_LIMIT = int(os.getenv('MEMORIES_QUERY_MESSAGE_LIMIT', '3'))
+MEMORIES_QUERY_CHAR_LIMIT = int(os.getenv('MEMORIES_QUERY_CHAR_LIMIT', '1200'))
 
 CODE_INTERPRETER_ENGINE = os.getenv('CODE_INTERPRETER_ENGINE', 'pyodide')
 
@@ -2769,6 +2771,8 @@ DEFAULT_CONFIG = {
     'memories.review_interval_turns': MEMORIES_REVIEW_INTERVAL_TURNS,
     'memories.user_char_limit': MEMORIES_USER_CHAR_LIMIT,
     'memories.context_char_limit': MEMORIES_CONTEXT_CHAR_LIMIT,
+    'memories.query_message_limit': MEMORIES_QUERY_MESSAGE_LIMIT,
+    'memories.query_char_limit': MEMORIES_QUERY_CHAR_LIMIT,
     'code_interpreter.engine': CODE_INTERPRETER_ENGINE,
     'code_interpreter.prompt_template': CODE_INTERPRETER_PROMPT_TEMPLATE,
     'code_interpreter.jupyter.url': CODE_INTERPRETER_JUPYTER_URL,
