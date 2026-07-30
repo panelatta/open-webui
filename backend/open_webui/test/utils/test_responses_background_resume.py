@@ -51,7 +51,7 @@ async def _run_streaming_handler(monkeypatch, response, form_data=None, event_ca
     async def fake_get_system_oauth_token(request, user):
         return None
 
-    async def fake_get_sorted_filter_ids(request, model, filter_ids):
+    async def fake_get_filter_functions(request, model, filter_ids):
         return []
 
     async def fake_process_filter_functions(**kwargs):
@@ -69,6 +69,16 @@ async def _run_streaming_handler(monkeypatch, response, form_data=None, event_ca
 
     async def fake_background_tasks_handler(ctx):
         return None
+
+    async def fake_publish_chat_finished_event(*args, **kwargs):
+        return None
+
+    async def fake_config_get(key, default=None):
+        return {
+            'code_interpreter.enable': True,
+            'code_interpreter.engine': 'pyodide',
+            'user.permissions': {},
+        }.get(key, default)
 
     async def fake_outlet_filter_handler(ctx):
         return None
@@ -97,9 +107,10 @@ async def _run_streaming_handler(monkeypatch, response, form_data=None, event_ca
         return event_caller_result
 
     monkeypatch.setattr(middleware, 'get_system_oauth_token', fake_get_system_oauth_token)
-    monkeypatch.setattr(middleware, 'get_sorted_filter_ids', fake_get_sorted_filter_ids)
+    monkeypatch.setattr(middleware, 'get_filter_functions', fake_get_filter_functions)
     monkeypatch.setattr(middleware, 'process_filter_functions', fake_process_filter_functions)
     monkeypatch.setattr(middleware, 'background_tasks_handler', fake_background_tasks_handler)
+    monkeypatch.setattr(middleware, 'publish_chat_finished_event', fake_publish_chat_finished_event)
     monkeypatch.setattr(middleware, 'outlet_filter_handler', fake_outlet_filter_handler)
     monkeypatch.setattr(middleware, 'get_updated_tool_function', fake_get_updated_tool_function)
     monkeypatch.setattr(middleware, 'process_tool_result', fake_process_tool_result)
@@ -117,6 +128,7 @@ async def _run_streaming_handler(monkeypatch, response, form_data=None, event_ca
     monkeypatch.setattr(middleware.Chats, 'get_chat_title_by_id', fake_get_chat_title_by_id)
     monkeypatch.setattr(middleware, 'ENABLE_REALTIME_CHAT_SAVE', False)
     monkeypatch.setattr(middleware, 'CHAT_RESPONSE_STREAM_RETRY_DELAY', 0)
+    monkeypatch.setattr(middleware.Config, 'get', staticmethod(fake_config_get))
 
     request = SimpleNamespace(
         state=SimpleNamespace(),
@@ -146,7 +158,7 @@ async def _run_streaming_handler(monkeypatch, response, form_data=None, event_ca
     ctx = {
         'request': request,
         'form_data': form_data,
-        'user': SimpleNamespace(id='user_1'),
+        'user': SimpleNamespace(id='user_1', role='admin'),
         'model': {
             'id': 'gpt-5-long',
             'provider': 'openai',

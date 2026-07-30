@@ -7,6 +7,7 @@ from typing import Optional
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from open_webui.config import RAG_EMBEDDING_CONTENT_PREFIX, RAG_EMBEDDING_QUERY_PREFIX
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
