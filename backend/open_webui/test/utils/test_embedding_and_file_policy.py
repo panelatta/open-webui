@@ -2,10 +2,14 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from starlette.datastructures import Headers, UploadFile
 
+from open_webui.routers import evaluations
 from open_webui.routers import files as files_router
 from open_webui.routers import memories
+from open_webui.routers import ollama
+from open_webui.routers import openai
 from open_webui.utils.embedding_policy import (
     EMBEDDING_DISABLED_MESSAGE,
     apply_memory_only_embedding_policy,
@@ -33,6 +37,59 @@ async def test_memory_only_embedding_policy_keeps_memory_function_separate():
     assert result == [0.25, 0.75]
     assert calls == [('remember this', None, 'user-1')]
     assert str(exc_info.value) == EMBEDDING_DISABLED_MESSAGE
+
+
+@pytest.mark.anyio
+async def test_provider_embedding_proxies_are_blocked():
+    request = SimpleNamespace()
+    user = SimpleNamespace()
+    endpoint_calls = [
+        lambda: ollama.embed(
+            request,
+            ollama.GenerateEmbedForm(model='embed-model', input='text'),
+            url_idx=None,
+            user=user,
+        ),
+        lambda: ollama.embeddings(
+            request,
+            ollama.GenerateEmbeddingsForm(model='embed-model', prompt='text'),
+            url_idx=None,
+            user=user,
+        ),
+        lambda: ollama.generate_openai_embeddings(
+            request,
+            {'model': 'embed-model', 'input': 'text'},
+            url_idx=None,
+            user=user,
+        ),
+        lambda: openai.embeddings(
+            request,
+            {'model': 'embed-model', 'input': 'text'},
+            user,
+        ),
+    ]
+
+    for endpoint_call in endpoint_calls:
+        with pytest.raises(HTTPException) as exc_info:
+            await endpoint_call()
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail == EMBEDDING_DISABLED_MESSAGE
+
+
+def test_evaluation_topic_filter_uses_lexical_similarity():
+    feedbacks = [
+        SimpleNamespace(id='exact', data={'tags': ['Coding']}),
+        SimpleNamespace(id='partial', data={'tags': ['Python coding']}),
+        SimpleNamespace(id='unrelated', data={'tags': ['Cooking']}),
+    ]
+
+    similarities = evaluations._compute_similarities(feedbacks, 'coding')
+
+    assert similarities == {
+        'exact': 1.0,
+        'partial': 0.8,
+        'unrelated': 0.0,
+    }
 
 
 @pytest.mark.anyio

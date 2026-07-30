@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import aiofiles
 import aiohttp
 from aiocache import cached
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +39,7 @@ from open_webui.models.models import Models
 from open_webui.models.users import UserModel
 from open_webui.utils.access_control import check_model_access
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.embedding_policy import EMBEDDING_DISABLED_MESSAGE
 from open_webui.utils.headers import get_custom_headers, include_user_info_headers
 from open_webui.utils.model_ids import strip_provider_model_prefix
 from open_webui.utils.json_codec import JSONCodec
@@ -880,8 +881,7 @@ async def embed(
     user=Depends(get_verified_user),
 ):
     """Generate embeddings via the Ollama /api/embed endpoint."""
-    if not await Config.get('ollama.enable'):
-        raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=EMBEDDING_DISABLED_MESSAGE)
 
     log.info(f'generate_ollama_batch_embeddings {form_data}')
     await check_model_access(user, await Models.get_model_by_id(form_data.model), BYPASS_MODEL_ACCESS_CONTROL)
@@ -931,8 +931,7 @@ async def embeddings(
     user=Depends(get_verified_user),
 ):
     """Generate embeddings via the legacy Ollama /api/embeddings endpoint."""
-    if not await Config.get('ollama.enable'):
-        raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=EMBEDDING_DISABLED_MESSAGE)
 
     log.info(f'generate_ollama_embeddings {form_data}')
     await check_model_access(user, await Models.get_model_by_id(form_data.model), BYPASS_MODEL_ACCESS_CONTROL)
@@ -1264,8 +1263,7 @@ async def generate_openai_embeddings(
     user=Depends(get_verified_user),  # noqa: B008
 ):
     """Forward an embeddings request via the OpenAI-compatible proxy."""
-    if not await Config.get('ollama.enable'):
-        raise HTTPException(status_code=503, detail=ERROR_MESSAGES.OLLAMA_API_DISABLED)
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=EMBEDDING_DISABLED_MESSAGE)
 
     metadata = form_data.pop('metadata', None)
 

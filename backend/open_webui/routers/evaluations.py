@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -54,28 +55,11 @@ async def get_config_values(key_map: dict[str, str]) -> dict:
 # Query-based re-ranking (optional):
 #    When a user searches for a topic (e.g., "coding"), we want to show
 #    which models perform best FOR THAT TOPIC. We do this by:
-#    1. Computing semantic similarity between the query and each feedback's tags
+#    1. Computing lexical similarity between the query and each feedback's tags
 #    2. Using that similarity as a weight in the Elo calculation
 #    3. Feedbacks about "coding" contribute more to the final ranking
 #    4. Feedbacks about unrelated topics (e.g., "cooking") contribute less
-#    This gives topic-specific leaderboards without needing separate data.
-
-import os
-
-EMBEDDING_MODEL_NAME = os.environ.get('AUXILIARY_EMBEDDING_MODEL', 'TaylorAI/bge-micro-v2')
-_embedding_model = None
-
-
-def _get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-
-            _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        except Exception as e:
-            log.error(f'Embedding model load failed: {e}')
-    return _embedding_model
+#    This gives topic-specific leaderboards without generating embeddings.
 
 
 def _calculate_elo(feedbacks: list[LeaderboardFeedbackData], similarities: dict = None) -> dict:
@@ -159,42 +143,37 @@ def _compute_similarities(feedbacks: list[LeaderboardFeedbackData], query: str) 
     """
     Compute how relevant each feedback is to a search query.
 
-    Uses embeddings to find semantic similarity between the query and
-    each feedback's tags. Higher similarity means the feedback is more
-    relevant to what the user searched for.
+    Uses normalized substring and token overlap against feedback tags. This
+    deployment reserves all embedding generation for memory routes.
 
     This is used to weight Elo calculations - feedbacks matching the
     query have more influence on the final rankings.
 
     Returns: {feedback_id: similarity_score (0-1)}
     """
-    import numpy as np
-
-    embedding_model = _get_embedding_model()
-    if not embedding_model:
+    normalized_query = query.casefold().strip()
+    if not normalized_query:
         return {}
 
-    all_tags = list({tag for feedback in feedbacks if feedback.data for tag in feedback.data.get('tags', [])})
-    if not all_tags:
-        return {}
+    query_tokens = set(re.findall(r'[^\W_]+', normalized_query))
 
-    try:
-        tag_embeddings = embedding_model.encode(all_tags)
-        query_embedding = embedding_model.encode([query])[0]
-    except Exception as e:
-        log.error(f'Embedding error: {e}')
-        return {}
+    def tag_similarity(tag: str) -> float:
+        normalized_tag = str(tag).casefold().strip()
+        if not normalized_tag:
+            return 0.0
+        if normalized_tag == normalized_query:
+            return 1.0
+        if normalized_query in normalized_tag or normalized_tag in normalized_query:
+            return 0.8
 
-    # Vectorized cosine similarity
-    tag_norms = np.linalg.norm(tag_embeddings, axis=1)
-    query_norm = np.linalg.norm(query_embedding)
-    similarities = np.dot(tag_embeddings, query_embedding) / (tag_norms * query_norm + 1e-9)
-    tag_similarity_map = dict(zip(all_tags, similarities.tolist()))
+        tag_tokens = set(re.findall(r'[^\W_]+', normalized_tag))
+        union = query_tokens | tag_tokens
+        return len(query_tokens & tag_tokens) / len(union) if union else 0.0
 
     return {
         feedback.id: max(
-            (tag_similarity_map.get(tag, 0) for tag in (feedback.data or {}).get('tags', [])),
-            default=0,
+            (tag_similarity(tag) for tag in (feedback.data or {}).get('tags', [])),
+            default=0.0,
         )
         for feedback in feedbacks
     }

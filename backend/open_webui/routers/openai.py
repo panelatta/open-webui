@@ -50,6 +50,7 @@ from open_webui.models.users import UserModel
 from open_webui.utils.access_control import check_model_access, has_connection_access, has_permission
 from open_webui.utils.anthropic import get_anthropic_models, is_anthropic_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.embedding_policy import EMBEDDING_DISABLED_MESSAGE
 from open_webui.utils.headers import get_custom_headers, include_user_info_headers
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.model_ids import strip_provider_model_prefix
@@ -2091,6 +2092,8 @@ async def embeddings(request: Request, form_data: dict, user):
     Returns:
         dict: OpenAI-compatible embeddings response.
     """
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=EMBEDDING_DISABLED_MESSAGE)
+
     idx = 0
     # Prepare payload/body
     body = json.dumps(form_data)

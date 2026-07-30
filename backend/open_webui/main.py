@@ -1116,9 +1116,6 @@ async def embeddings(request: Request, form_data: dict, user=Depends(get_verifie
     Returns:
         dict: OpenAI-compatible embeddings response.
     """
-    # Make sure models are loaded in app state
-    if not request.app.state.MODELS:
-        await get_all_models(request, user=user)
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=EMBEDDING_DISABLED_MESSAGE)
 
 
