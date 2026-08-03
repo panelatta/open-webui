@@ -147,6 +147,7 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
         await Config.get('task.model.default'),
         await Config.get('task.model.external'),
         models,
+        prefer_base_model=True,
     )
 
     log.debug(f'generating chat title using model {task_model_id} for user {user.email} ')

@@ -13,7 +13,14 @@ log = logging.getLogger(__name__)
 
 # Let the right tool be given for the work at hand,
 # not the one that flatters, but the one that serves.
-def get_task_model_id(default_model_id: str, task_model: str, task_model_external: str, models) -> str:
+def get_task_model_id(
+    default_model_id: str,
+    task_model: str,
+    task_model_external: str,
+    models,
+    *,
+    prefer_base_model: bool = False,
+) -> str:
     # Set the task model
     task_model_id = default_model_id
     # Check if the user has a custom task model and use that model
@@ -23,6 +30,18 @@ def get_task_model_id(default_model_id: str, task_model: str, task_model_externa
     else:
         if task_model_external and task_model_external in models:
             task_model_id = task_model_external
+
+    # Lightweight tasks such as title generation should not inherit a preset's
+    # chat-specific system prompt, tools, or expensive reasoning parameters
+    # unless an administrator explicitly selected that preset as the task
+    # model. When no task model override is configured, use the preset's base
+    # model if it is available.
+    if prefer_base_model and task_model_id == default_model_id:
+        default_model = models.get(default_model_id, {}) or {}
+        model_info = default_model.get('info', {}) or {}
+        base_model_id = default_model.get('base_model_id') or model_info.get('base_model_id')
+        if base_model_id and base_model_id in models:
+            task_model_id = base_model_id
 
     return task_model_id
 

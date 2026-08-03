@@ -385,78 +385,75 @@
 	};
 
 	const generateTitleHandler = async () => {
+		if (generating) return;
 		generating = true;
-		chat = await getChatById(localStorage.token, id);
 
-		const chatContent = chat.chat;
+		try {
+			chat = await getChatById(localStorage.token, id);
+			const chatContent = chat.chat;
 
-		// Build the active branch message list from the history tree.
-		// Fallback to the legacy flat messages array for older chats
-		// that haven't been migrated to the tree structure yet.
-		const history = chatContent?.history;
-		let messages = [];
-		if (history?.messages && history?.currentId) {
-			messages = createMessagesList(history, history.currentId).map((message: any) => ({
-				role: message.role,
-				content: getOutputText(message.output) || message.content || ''
-			}));
-		} else {
-			messages = (chatContent?.messages ?? []).map((message: any) => ({
-				role: message.role,
-				content: getOutputText(message.output) || message.content || ''
-			}));
-		}
+			// Build the active branch message list from the history tree.
+			// Fallback to the legacy flat messages array for older chats
+			// that haven't been migrated to the tree structure yet.
+			const history = chatContent?.history;
+			let messages = [];
+			if (history?.messages && history?.currentId) {
+				messages = createMessagesList(history, history.currentId).map((message: any) => ({
+					role: message.role,
+					content: getOutputText(message.output) || message.content || ''
+				}));
+			} else {
+				messages = (chatContent?.messages ?? []).map((message: any) => ({
+					role: message.role,
+					content: getOutputText(message.output) || message.content || ''
+				}));
+			}
 
-		// Resolve the model from the most recent assistant message in the
-		// active branch. This avoids using the stale top-level `models`
-		// array which may reference a model from an older edit.
-		let model = '';
-
-		// For the active chat, prefer the live dropdown selection.
-		if (id === $chatId) {
-			try {
-				model = JSON.parse(sessionStorage.selectedModels || '[]').find((m) => m) ?? '';
-			} catch {}
-		}
-
-		if (!model && history?.messages && history?.currentId) {
-			let currentId = history.currentId;
-			while (currentId) {
-				const msg = history.messages[currentId];
-				if (!msg) break;
-				if (msg.role === 'assistant' && msg.model) {
-					model = msg.model;
-					break;
+			// Prefer the model persisted on the active branch. sessionStorage can
+			// briefly contain the previous chat's selection during navigation.
+			let model = '';
+			if (history?.messages && history?.currentId) {
+				let currentId = history.currentId;
+				while (currentId) {
+					const msg = history.messages[currentId];
+					if (!msg) break;
+					if (msg.role === 'assistant' && msg.model) {
+						model = msg.model;
+						break;
+					}
+					currentId = msg.parentId;
 				}
-				currentId = msg.parentId;
 			}
-		}
 
-		// Fallback to top-level models if no model was found in the history
-		if (!model) {
-			model = chatContent?.models?.at(0) ?? '';
-		}
-
-		chatTitle = '';
-
-		const generatedTitle = await generateTitle(localStorage.token, model, messages).catch(
-			(error) => {
-				toast.error(`${error}`);
-				return null;
+			if (!model && id === $chatId) {
+				try {
+					model = JSON.parse(sessionStorage.selectedModels || '[]').find((m) => m) ?? '';
+				} catch {}
 			}
-		);
 
-		if (generatedTitle) {
+			if (!model) {
+				model = chatContent?.models?.at(0) ?? '';
+			}
+
+			const generatedTitle = await generateTitle(localStorage.token, model, messages, id);
+			if (!generatedTitle) {
+				throw new Error($i18n.t('Failed to generate title'));
+			}
+
 			if (generatedTitle !== title) {
-				editChatTitle(id, generatedTitle);
+				await editChatTitle(id, generatedTitle);
 			}
-
 			confirmEdit = false;
-		} else {
+		} catch (error) {
 			chatTitle = title;
+			toast.error(
+				typeof error === 'string'
+					? error
+					: (error as any)?.detail || (error as any)?.message || $i18n.t('Failed to generate title')
+			);
+		} finally {
+			generating = false;
 		}
-
-		generating = false;
 	};
 </script>
 
