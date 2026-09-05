@@ -1,6 +1,22 @@
 from open_webui.routers.openai import convert_to_responses_payload
 
 
+def test_responses_keeps_hosted_files_proxy_file_data_and_image_detail():
+    payload = convert_to_responses_payload({
+        'model': 'gpt-5',
+        'messages': [{'role': 'user', 'content': [
+            {'type': 'input_file', 'file_id': 'file-hosted'},
+            {'type': 'file', 'file': {'file_data': 'data:text/plain;base64,aGk=', 'filename': 'test.txt'}},
+            {'type': 'image_url', 'image_url': {'url': 'https://example.com/image.png', 'detail': 'high'}},
+        ]}],
+    })
+    assert payload['input'][0]['content'] == [
+        {'type': 'input_file', 'file_id': 'file-hosted'},
+        {'type': 'input_file', 'file_data': 'data:text/plain;base64,aGk=', 'filename': 'test.txt'},
+        {'type': 'input_image', 'image_url': 'https://example.com/image.png', 'detail': 'high'},
+    ]
+
+
 def test_convert_to_responses_payload_moves_developer_prompt_to_instructions():
     payload = {
         "model": "gpt-5.5",

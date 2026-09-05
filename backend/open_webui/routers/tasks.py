@@ -21,6 +21,7 @@ from open_webui.routers.pipelines import process_pipeline_inlet_filter
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.models import get_all_models
+from open_webui.utils.payload import apply_params_to_form_data
 from open_webui.utils.task import (
     autocomplete_generation_template,
     emoji_generation_template,
@@ -41,6 +42,7 @@ router = APIRouter()
 TASK_CONFIG_KEYS = {
     'TASK_MODEL': 'task.model.default',
     'TASK_MODEL_EXTERNAL': 'task.model.external',
+    'TASK_MODEL_PARAMS': 'task.model.params',
     'TITLE_GENERATION_PROMPT_TEMPLATE': 'task.title.prompt_template',
     'IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE': 'task.image.prompt_template',
     'ENABLE_AUTOCOMPLETE_GENERATION': 'task.autocomplete.enable',
@@ -69,6 +71,37 @@ def config_updates(data: dict, key_map: dict[str, str]) -> dict:
     return {key_map[field]: value for field, value in data.items() if field in key_map}
 
 
+def apply_task_model_params(payload: dict, models: dict, task_model_id: str, params: dict | None = None) -> dict:
+    model = models.get(payload.get('model')) or models.get(task_model_id)
+    if not model or (not params and not payload.get('params')):
+        return payload
+    return apply_params_to_form_data(payload, model, params or None)
+
+
+async def get_task_model_generation_config(
+    default_model_id: str, models, *, prefer_base_model: bool = False
+) -> tuple[str, dict]:
+    config = await Config.get_many(
+        'task.model.default',
+        'task.model.external',
+        'task.model.params',
+    )
+    params = config.get('task.model.params') or {}
+    if not isinstance(params, dict):
+        params = {}
+
+    return (
+        get_task_model_id(
+            default_model_id,
+            config.get('task.model.default'),
+            config.get('task.model.external'),
+            models,
+            prefer_base_model=prefer_base_model,
+        ),
+        {key: value for key, value in params.items() if value is not None and value != ''},
+    )
+
+
 ##################################
 #
 # Task Endpoints
@@ -84,6 +117,7 @@ async def get_task_config(request: Request, user=Depends(get_verified_user)):
 class TaskConfigForm(BaseModel):
     TASK_MODEL: Optional[str]
     TASK_MODEL_EXTERNAL: Optional[str]
+    TASK_MODEL_PARAMS: dict | None = None
     ENABLE_TITLE_GENERATION: bool
     TITLE_GENERATION_PROMPT_TEMPLATE: str
     IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE: str
@@ -118,7 +152,7 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **request.app.state.MODELS,
+            **dict(request.app.state.MODELS.items()),
             request.state.model['id']: request.state.model,
         }
     else:
@@ -140,17 +174,9 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    task_model_id = get_task_model_id(
-        model_id,
-        await Config.get('task.model.default'),
-        await Config.get('task.model.external'),
-        models,
-        prefer_base_model=True,
-    )
+    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models, prefer_base_model=True)
 
-    log.debug(f'generating chat title using model {task_model_id} for user {user.email} ')
+    log.debug('generating chat title using model %s for user %s ', task_model_id, user.email)
 
     title_template = await Config.get('task.title.prompt_template')
     if title_template != '':
@@ -159,20 +185,14 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
         template = DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE
 
     content = await title_generation_template(template, form_data['messages'], user)
-
-    max_tokens = models[task_model_id].get('info', {}).get('params', {}).get('max_tokens', 1000)
+    task_model_params = task_model_params or {
+        'max_tokens': models[task_model_id].get('info', {}).get('params', {}).get('max_tokens', 1000)
+    }
 
     payload = {
         'model': task_model_id,
         'messages': [{'role': 'user', 'content': content}],
         'stream': False,
-        **(
-            {'max_tokens': max_tokens}
-            if models[task_model_id].get('owned_by') == 'ollama'
-            else {
-                'max_completion_tokens': max_tokens,
-            }
-        ),
         'metadata': {
             **(request.state.metadata if hasattr(request.state, 'metadata') else {}),
             'task': str(TASKS.TITLE_GENERATION),
@@ -186,6 +206,8 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
         payload = await process_pipeline_inlet_filter(request, payload, user, models)
     except Exception as e:
         raise e
+
+    payload = apply_task_model_params(payload, models, task_model_id, task_model_params)
 
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)
@@ -207,7 +229,7 @@ async def generate_follow_ups(request: Request, form_data: dict, user=Depends(ge
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **request.app.state.MODELS,
+            **dict(request.app.state.MODELS.items()),
             request.state.model['id']: request.state.model,
         }
     else:
@@ -224,16 +246,9 @@ async def generate_follow_ups(request: Request, form_data: dict, user=Depends(ge
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    task_model_id = get_task_model_id(
-        model_id,
-        await Config.get('task.model.default'),
-        await Config.get('task.model.external'),
-        models,
-    )
+    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
 
-    log.debug(f'generating chat title using model {task_model_id} for user {user.email} ')
+    log.debug('generating chat title using model %s for user %s ', task_model_id, user.email)
 
     follow_up_template = await Config.get('task.follow_up.prompt_template')
     if follow_up_template != '':
@@ -261,6 +276,8 @@ async def generate_follow_ups(request: Request, form_data: dict, user=Depends(ge
     except Exception as e:
         raise e
 
+    payload = apply_task_model_params(payload, models, task_model_id, task_model_params)
+
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)
     except Exception as e:
@@ -281,7 +298,7 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **request.app.state.MODELS,
+            **dict(request.app.state.MODELS.items()),
             request.state.model['id']: request.state.model,
         }
     else:
@@ -298,16 +315,9 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    task_model_id = get_task_model_id(
-        model_id,
-        await Config.get('task.model.default'),
-        await Config.get('task.model.external'),
-        models,
-    )
+    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
 
-    log.debug(f'generating chat tags using model {task_model_id} for user {user.email} ')
+    log.debug('generating chat tags using model %s for user %s ', task_model_id, user.email)
 
     tags_template = await Config.get('task.tags.prompt_template')
     if tags_template != '':
@@ -335,6 +345,8 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
     except Exception as e:
         raise e
 
+    payload = apply_task_model_params(payload, models, task_model_id, task_model_params)
+
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)
     except Exception as e:
@@ -349,7 +361,7 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
 async def generate_image_prompt(request: Request, form_data: dict, user=Depends(get_verified_user)):
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **request.app.state.MODELS,
+            **dict(request.app.state.MODELS.items()),
             request.state.model['id']: request.state.model,
         }
     else:
@@ -362,16 +374,9 @@ async def generate_image_prompt(request: Request, form_data: dict, user=Depends(
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    task_model_id = get_task_model_id(
-        model_id,
-        await Config.get('task.model.default'),
-        await Config.get('task.model.external'),
-        models,
-    )
+    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
 
-    log.debug(f'generating image prompt using model {task_model_id} for user {user.email} ')
+    log.debug('generating image prompt using model %s for user %s ', task_model_id, user.email)
 
     image_prompt_template = await Config.get('task.image.prompt_template')
     if image_prompt_template != '':
@@ -398,6 +403,8 @@ async def generate_image_prompt(request: Request, form_data: dict, user=Depends(
         payload = await process_pipeline_inlet_filter(request, payload, user, models)
     except Exception as e:
         raise e
+
+    payload = apply_task_model_params(payload, models, task_model_id, task_model_params)
 
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)
@@ -426,12 +433,12 @@ async def generate_queries(request: Request, form_data: dict, user=Depends(get_v
             )
 
     if getattr(request.state, 'cached_queries', None):
-        log.info(f'Reusing cached queries: {request.state.cached_queries}')
+        log.info('Reusing cached queries: %s', request.state.cached_queries)
         return request.state.cached_queries
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **request.app.state.MODELS,
+            **dict(request.app.state.MODELS.items()),
             request.state.model['id']: request.state.model,
         }
     else:
@@ -444,16 +451,9 @@ async def generate_queries(request: Request, form_data: dict, user=Depends(get_v
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    task_model_id = get_task_model_id(
-        model_id,
-        await Config.get('task.model.default'),
-        await Config.get('task.model.external'),
-        models,
-    )
+    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
 
-    log.debug(f'generating {type} queries using model {task_model_id} for user {user.email}')
+    log.debug('generating %s queries using model %s for user %s', type, task_model_id, user.email)
 
     query_template = await Config.get('task.query.prompt_template')
     if query_template.strip() != '':
@@ -480,6 +480,8 @@ async def generate_queries(request: Request, form_data: dict, user=Depends(get_v
         payload = await process_pipeline_inlet_filter(request, payload, user, models)
     except Exception as e:
         raise e
+
+    payload = apply_task_model_params(payload, models, task_model_id, task_model_params)
 
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)
@@ -512,7 +514,7 @@ async def generate_autocompletion(request: Request, form_data: dict, user=Depend
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **request.app.state.MODELS,
+            **dict(request.app.state.MODELS.items()),
             request.state.model['id']: request.state.model,
         }
     else:
@@ -525,16 +527,9 @@ async def generate_autocompletion(request: Request, form_data: dict, user=Depend
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    task_model_id = get_task_model_id(
-        model_id,
-        await Config.get('task.model.default'),
-        await Config.get('task.model.external'),
-        models,
-    )
+    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
 
-    log.debug(f'generating autocompletion using model {task_model_id} for user {user.email}')
+    log.debug('generating autocompletion using model %s for user %s', task_model_id, user.email)
 
     autocomplete_template = await Config.get('task.autocomplete.prompt_template')
     if autocomplete_template.strip() != '':
@@ -562,6 +557,8 @@ async def generate_autocompletion(request: Request, form_data: dict, user=Depend
     except Exception as e:
         raise e
 
+    payload = apply_task_model_params(payload, models, task_model_id, task_model_params)
+
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)
     except Exception as e:
@@ -576,7 +573,7 @@ async def generate_autocompletion(request: Request, form_data: dict, user=Depend
 async def generate_emoji(request: Request, form_data: dict, user=Depends(get_verified_user)):
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **request.app.state.MODELS,
+            **dict(request.app.state.MODELS.items()),
             request.state.model['id']: request.state.model,
         }
     else:
@@ -589,16 +586,9 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    # Check if the user has a custom task model
-    # If the user has a custom task model, use that model
-    task_model_id = get_task_model_id(
-        model_id,
-        await Config.get('task.model.default'),
-        await Config.get('task.model.external'),
-        models,
-    )
+    task_model_id, _ = await get_task_model_generation_config(model_id, models)
 
-    log.debug(f'generating emoji using model {task_model_id} for user {user.email} ')
+    log.debug('generating emoji using model %s for user %s ', task_model_id, user.email)
 
     template = DEFAULT_EMOJI_GENERATION_PROMPT_TEMPLATE
 
@@ -608,13 +598,6 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
         'model': task_model_id,
         'messages': [{'role': 'user', 'content': content}],
         'stream': False,
-        **(
-            {'max_tokens': 4}
-            if models[task_model_id].get('owned_by') == 'ollama'
-            else {
-                'max_completion_tokens': 4,
-            }
-        ),
         'metadata': {
             **(request.state.metadata if hasattr(request.state, 'metadata') else {}),
             'task': str(TASKS.EMOJI_GENERATION),
@@ -629,6 +612,8 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
     except Exception as e:
         raise e
 
+    payload = apply_task_model_params(payload, models, task_model_id, {'max_tokens': 4})
+
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)
     except Exception as e:
@@ -642,7 +627,7 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
 async def generate_moa_response(request: Request, form_data: dict, user=Depends(get_verified_user)):
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **request.app.state.MODELS,
+            **dict(request.app.state.MODELS.items()),
             request.state.model['id']: request.state.model,
         }
     else:

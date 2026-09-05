@@ -149,3 +149,61 @@ async def test_file_upload_process_true_is_forced_to_storage_only(monkeypatch):
     assert captured['user_id'] == user.id
     assert captured['form_data'].data == {'content': 'chat attachment'}
     assert 'collection_name' not in captured['form_data'].meta
+
+
+@pytest.mark.anyio
+async def test_memory_reindex_uses_memory_function_only(monkeypatch):
+    calls = []
+    upserts = []
+
+    async def embedding(content, *, prefix=None, user=None):
+        calls.append(content)
+        return [0.25, 0.75]
+
+    async def delete_collection(name):
+        assert name == 'user-memory-policy-test'
+
+    async def upsert(**kwargs):
+        upserts.append(kwargs)
+
+    state = SimpleNamespace()
+    apply_memory_only_embedding_policy(state, embedding)
+    monkeypatch.setattr(memories, 'ASYNC_VECTOR_DB_CLIENT', SimpleNamespace(
+        delete_collection=delete_collection, upsert=upsert,
+    ))
+    memory = SimpleNamespace(id='memory-test', content='remember', path=None,
+                             type='user', created_at=1, updated_at=1)
+    count = await memories.reindex_memory_vectors_for_user(
+        SimpleNamespace(app=SimpleNamespace(state=state)), 'policy-test',
+        memories=[memory], user=SimpleNamespace(id='policy-test'),
+    )
+    assert count == 1
+    assert calls == ['remember']
+    assert upserts[0]['collection_name'] == 'user-memory-policy-test'
+    assert upserts[0]['items'][0]['vector'] == [0.25, 0.75]
+
+
+@pytest.mark.anyio
+async def test_chat_attachment_is_uploaded_as_hosted_file(monkeypatch):
+    from open_webui.routers.openai import inject_openai_files_into_messages, convert_to_responses_payload
+
+    uploads = []
+    consumed = []
+
+    async def ensure_file(request, file_id, **kwargs):
+        uploads.append((file_id, kwargs['idx']))
+        return 'file-hosted-test'
+
+    async def consume(file_id):
+        consumed.append(file_id)
+
+    monkeypatch.setattr(openai, 'ensure_openai_file_id', ensure_file)
+    monkeypatch.setattr(openai, 'mark_openai_file_id_consumed', consume)
+    payload = await inject_openai_files_into_messages(
+        SimpleNamespace(), {'model': 'gpt-5', 'messages': [{'role': 'user', 'content': 'Read this'}]},
+        {'files': [{'type': 'file', 'id': 'local-test'}]}, SimpleNamespace(id='user-test'), idx=2,
+    )
+    converted = convert_to_responses_payload(payload)
+    assert uploads == [('local-test', 2)]
+    assert consumed == ['local-test']
+    assert converted['input'][0]['content'][0] == {'type': 'input_file', 'file_id': 'file-hosted-test'}

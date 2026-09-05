@@ -134,6 +134,7 @@ async def _run_streaming_handler(monkeypatch, response, form_data=None, event_ca
         state=SimpleNamespace(),
         app=SimpleNamespace(
             state=SimpleNamespace(
+                redis=None,
                 config=SimpleNamespace(
                     ENABLE_USER_WEBHOOKS=False,
                     CODE_INTERPRETER_ENGINE='pyodide',
@@ -737,7 +738,7 @@ async def test_code_interpreter_followup_stream_error_does_not_run_contextual_re
             'chat_id': 'chat_1',
             'message_id': 'message_1',
             'session_id': 'session_1',
-            'params': {},
+            'params': {'function_calling': 'legacy'},
             'features': {'code_interpreter': True},
         },
     }
