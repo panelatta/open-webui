@@ -12,6 +12,9 @@ echo "NODE_OPTIONS=--max-old-space-size=${MAX_OLD_SPACE_MB}"
 echo "This entry is intended for low-resource hosts. It uses lower CPU/IO priority."
 
 export NODE_OPTIONS="--max-old-space-size=${MAX_OLD_SPACE_MB} ${NODE_OPTIONS:-}"
+# Source maps are not needed to serve the app and substantially increase
+# peak memory while Rollup renders chunks on small hosts.
+export VITE_BUILD_SOURCEMAP="${SAFE_BUILD_SOURCEMAP:-false}"
 
 run_low_priority() {
 	if command -v ionice >/dev/null 2>&1; then

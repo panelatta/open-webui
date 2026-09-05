@@ -23,7 +23,7 @@ export default defineConfig({
 		APP_BUILD_HASH: JSON.stringify(process.env.APP_BUILD_HASH || 'dev-build')
 	},
 	build: {
-		sourcemap: true
+		sourcemap: process.env.VITE_BUILD_SOURCEMAP !== 'false'
 	},
 	server: {
 		proxy: {
