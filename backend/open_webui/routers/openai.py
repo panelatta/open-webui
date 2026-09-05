@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
 import logging
 import time
 import re
@@ -229,25 +230,6 @@ def summarize_response_debug_value(value):
             for key, item in value.items()
         }
     return value
-
-
-def stream_sse_lines(stream: aiohttp.StreamReader):
-    async def yield_sse_lines():
-        buffer = b""
-
-        async for data, _ in stream.iter_chunks():
-            if not data:
-                continue
-
-            buffer += data
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                yield line + b"\n"
-
-        if buffer:
-            yield buffer
-
-    return yield_sse_lines()
 
 
 async def get_headers_and_cookies(
@@ -2280,13 +2262,12 @@ async def generate_chat_completion(
                         )
 
                 streaming = True
-                content_handler = stream_sse_lines if is_responses else stream_chunks_handler
                 response_headers = _clean_proxy_headers(r.headers)
                 if is_responses:
                     response_headers['x-openwebui-openai-url-idx'] = str(idx)
                     response_headers['x-openwebui-openai-base-url'] = url
                 return StreamingResponse(
-                    stream_wrapper(r, content_handler=content_handler),
+                    stream_wrapper(r),
                     status_code=r.status,
                     headers=response_headers,
                 )
@@ -2602,7 +2583,7 @@ async def resume_response_stream(
             response_headers['x-openwebui-openai-url-idx'] = str(idx)
             response_headers['x-openwebui-openai-base-url'] = url
             return StreamingResponse(
-                stream_wrapper(r, content_handler=stream_sse_lines),
+                stream_wrapper(r),
                 status_code=r.status,
                 headers=response_headers,
             )
@@ -2704,7 +2685,7 @@ async def get_response(
             response_headers['x-openwebui-openai-url-idx'] = str(idx)
             response_headers['x-openwebui-openai-base-url'] = url
             return StreamingResponse(
-                stream_wrapper(r, content_handler=stream_sse_lines),
+                stream_wrapper(r),
                 status_code=r.status,
                 headers=response_headers,
             )

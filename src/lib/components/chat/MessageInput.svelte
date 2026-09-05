@@ -881,18 +881,8 @@
 		servers: any[] | null = $terminalServers,
 		settingsValue: any = $settings
 	) => {
-		if (!selectedId) return null;
-
-		const systemTerminal = (servers ?? []).find(
-			(t: any) => t.id && t.id === selectedId && t.config?.chat_uploads === 'filesystem'
-		);
-		if (systemTerminal) return systemTerminal;
-
-		return (
-			(settingsValue?.terminalServers ?? []).find(
-				(t: any) => t.url === selectedId && t.enabled && t.config?.chat_uploads === 'filesystem'
-			) ?? null
-		);
+		// Chat attachments must use the hosted upload path in this deployment.
+		return null;
 	};
 
 	const uploadFileHandler = async (file, process = false, itemData = {}) => {
