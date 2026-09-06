@@ -6613,6 +6613,19 @@ async def streaming_chat_response_handler(response, ctx):
                                                 reasoning_item = output[-1]
 
                                         if reasoning_content:
+                                            # A GPT reasoning placeholder can also be followed by
+                                            # Chat Completions deltas. Adopt that format before
+                                            # appending text so the answer closes the reasoning
+                                            # item instead of entering a tag block with empty tags.
+                                            if is_transient_reasoning_placeholder(reasoning_item):
+                                                reasoning_item.pop('_placeholder', None)
+                                                reasoning_item.update(
+                                                    {
+                                                        'start_tag': '<think>',
+                                                        'end_tag': '</think>',
+                                                        'attributes': {'type': 'reasoning_content'},
+                                                    }
+                                                )
                                             # Append to reasoning content
                                             parts = reasoning_item.get('content', [])
                                             if parts and parts[-1].get('type') == 'output_text':

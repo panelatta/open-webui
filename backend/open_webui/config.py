@@ -2224,12 +2224,15 @@ CONTEXT_COMPACTION_PROMPT_TEMPLATE = os.getenv('CONTEXT_COMPACTION_PROMPT_TEMPLA
 TITLE_GENERATION_PROMPT_TEMPLATE = os.getenv('TITLE_GENERATION_PROMPT_TEMPLATE', '')
 
 DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE = """### Task:
-Generate a concise title summarizing the chat history.
+Generate a concise title summarizing the chat history, using the primary language of the user's questions.
 ### Guidelines:
 - The title should clearly represent the main theme or subject of the conversation.
-- Keep it short: 2-4 words is best.
+- Keep it short: about 6-16 Chinese characters or 2-4 English words is best.
 - Do not use emojis, quotation marks, or special formatting.
-- Write the title in the chat's primary language; default to English if multilingual.
+- Determine the title language from the user's own questions, not from assistant reasoning, assistant answers, tool output, or quoted reference material.
+- If the user mainly asks in Chinese, write the title in Chinese even when the question includes a few English technical terms or words from other languages. Keep product names and necessary technical identifiers in their original form.
+- If the user clearly asks in English, write the title in English, even when assistant answers or reference material are in Chinese.
+- For other languages, follow the primary language of the user's questions. If the user switches languages, prioritize the latest substantive user question; do not default to English merely because multiple languages appear.
 - Prioritize accuracy over creativity.
 - Your entire response must consist solely of the JSON object, without any introductory or concluding text.
 - The output must be a single, raw JSON object, without any markdown code fences or other encapsulating text.
@@ -2237,10 +2240,9 @@ Generate a concise title summarizing the chat history.
 ### Output:
 JSON format: { "title": "your concise title here" }
 ### Examples:
-- { "title": "Stock Trends" },
-- { "title": "Chocolate Chip Cookies" },
-- { "title": "Music Streaming" },
-- { "title": "Remote Work" }
+- User asks "如何排查 Open WebUI 的 Responses API 超时？" -> { "title": "Open WebUI 超时排查" }
+- User asks "请总结 remote work 对股票走势的影响。" -> { "title": "远程办公对股价的影响" }
+- User asks "How does remote work affect stock prices?" -> { "title": "Remote Work and Stocks" }
 ### Chat History:
 <chat_history>
 {{MESSAGES:END:2}}

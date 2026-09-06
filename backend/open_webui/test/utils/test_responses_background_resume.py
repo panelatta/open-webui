@@ -44,8 +44,8 @@ def _completed_response_event(response_id='resp_1', sequence_number=2, text='don
     }
 
 
-async def _run_streaming_handler(monkeypatch, response, form_data=None, event_caller_result=None):
-    events = []
+async def _run_streaming_handler(monkeypatch, response, form_data=None, event_caller_result=None, events=None):
+    events = [] if events is None else events
     upserts = []
 
     async def fake_get_system_oauth_token(request, user):
@@ -174,6 +174,53 @@ async def _run_streaming_handler(monkeypatch, response, form_data=None, event_ca
 
     await middleware.streaming_chat_response_handler(response, ctx)
     return events, upserts
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('model_id', ['claude-test', 'gpt-5-test'])
+async def test_reasoning_pause_does_not_finish_chat_before_answer(monkeypatch, model_id):
+    from open_webui.routers.chats import overlay_response_streams
+    from open_webui.tasks import response_streams
+
+    events = []
+
+    async def stream():
+        yield 'data: {"choices":[{"delta":{"reasoning_content":"Still thinking"}}]}\n\n'
+        # Repeated reads of unchanged reasoning must remain explicitly active.
+        # Text stability is not a server-side completion signal.
+        for _ in range(2):
+            snapshot = response_streams['message_1']
+            chat = {'chat': {'history': {'messages': {'message_1': {'done': True}}}}}
+            message = overlay_response_streams(chat, [snapshot])['chat']['history']['messages']['message_1']
+            assert message['done'] is False
+            assert message['output'][0]['status'] == 'in_progress'
+            assert not any(e['type'] == 'chat:completion' and e['data'].get('done') for e in events)
+        yield 'data: {"choices":[{"delta":{"content":"中文回答"}}]}\n\n'
+        assert any(
+            e['type'] == 'response:completion'
+            and e['data'].get('type') == 'response.output_text.delta'
+            and e['data'].get('delta') == '中文回答'
+            for e in events
+        )
+        yield 'data: [DONE]\n\n'
+
+    _, upserts = await _run_streaming_handler(
+        monkeypatch,
+        StreamingResponse(stream(), media_type='text/event-stream'),
+        form_data={'model': model_id, 'stream': True, 'messages': [{'role': 'user', 'content': 'Hello'}]},
+        events=events,
+    )
+    completions = [e for e in events if e['type'] == 'chat:completion' and e['data'].get('done')]
+    assert len(completions) == 1
+    final_output = completions[0]['data']['output']
+    assert middleware.get_output_text([item for item in final_output if item['type'] == 'message']) == '中文回答'
+    reasoning_output = [item for item in final_output if item['type'] == 'reasoning']
+    assert len(reasoning_output) == 1
+    assert reasoning_output[0]['content'][0]['text'] == 'Still thinking'
+    assert reasoning_output[0]['duration'] >= 0
+    assert all(item['status'] == 'completed' for item in final_output)
+    assert upserts[-1]['done'] is True
+    assert 'message_1' not in response_streams
 
 
 def test_background_resume_requires_global_switch(monkeypatch):
