@@ -2,7 +2,7 @@
 	import { getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as I18n } from 'i18next';
-	import { changeLanguage } from '$lib/i18n';
+	import { saveAccountLanguage, savingAccountLanguage } from '$lib/i18n/account';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 
 	const i18n = getContext<Writable<I18n>>('i18n');
@@ -17,9 +17,11 @@
 	<button
 		id="chat-language-toggle"
 		type="button"
-		class="flex h-11 shrink-0 cursor-pointer items-center justify-center gap-1 rounded-lg px-2 text-xs text-gray-500 transition hover:bg-gray-50/40 hover:text-gray-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-400 dark:text-gray-400 dark:hover:bg-gray-800/40 dark:hover:text-gray-200 sm:h-8"
+		class="flex h-11 shrink-0 cursor-pointer items-center justify-center gap-1 rounded-lg px-2 text-xs text-gray-500 transition hover:bg-gray-50/40 hover:text-gray-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-400 disabled:cursor-wait disabled:opacity-50 dark:text-gray-400 dark:hover:bg-gray-800/40 dark:hover:text-gray-200 sm:h-8"
 		aria-label={label}
-		on:click={() => changeLanguage(isChinese ? 'en-US' : 'zh-CN')}
+		disabled={$savingAccountLanguage}
+		aria-busy={$savingAccountLanguage}
+		on:click={() => saveAccountLanguage(localStorage.token, isChinese ? 'en-US' : 'zh-CN')}
 	>
 		<span
 			aria-hidden="true"

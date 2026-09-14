@@ -83,7 +83,7 @@ export const getLanguages = async () => {
 };
 export const changeLanguage = (lang: string) => {
 	document.documentElement.setAttribute('lang', lang);
-	i18next.changeLanguage(lang);
+	return i18next.changeLanguage(lang);
 };
 
 export default i18n;

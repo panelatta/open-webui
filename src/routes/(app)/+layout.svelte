@@ -14,6 +14,7 @@
 	import { getBanners } from '$lib/apis/configs';
 	import { getTerminalServers } from '$lib/apis/terminal';
 	import { getUserSettings } from '$lib/apis/users';
+	import { applyAccountLanguage } from '$lib/i18n/account';
 	import { setAppFontFamily, setTextScale } from '$lib/utils/text-scale';
 
 	import { WEBUI_VERSION, WEBUI_API_BASE_URL } from '$lib/constants';
@@ -91,6 +92,7 @@
 
 	const setUserSettings = async (cb?: () => Promise<void>) => {
 		const userSettings = await getUserSettings(localStorage.token);
+		await applyAccountLanguage(userSettings?.language);
 
 		if (userSettings?.ui) {
 			settings.set(userSettings.ui);

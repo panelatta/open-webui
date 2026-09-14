@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { createEventDispatcher, onMount, getContext } from 'svelte';
-	import { getLanguages, changeLanguage } from '$lib/i18n';
+	import { getLanguages } from '$lib/i18n';
+	import { saveAccountLanguage, savingAccountLanguage } from '$lib/i18n/account';
 	const dispatch = createEventDispatcher();
 
 	import { config, models, settings, theme, user } from '$lib/stores';
@@ -21,7 +22,7 @@
 	let selectedTheme = 'system';
 
 	let languages: Awaited<ReturnType<typeof getLanguages>> = [];
-	let lang = $i18n.language;
+	$: lang = $i18n.language;
 	let system = '';
 
 	let showAdvanced = false;
@@ -229,8 +230,10 @@
 					bind:value={lang}
 					ariaLabel={$i18n.t('Language')}
 					placeholder={$i18n.t('Select a language')}
-					on:change={(e) => {
-						changeLanguage(lang);
+					disabled={$savingAccountLanguage}
+					on:change={async () => {
+						await saveAccountLanguage(localStorage.token, lang);
+						lang = $i18n.language;
 					}}
 				>
 					{#each languages as language}
