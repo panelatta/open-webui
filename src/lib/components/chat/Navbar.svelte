@@ -36,6 +36,7 @@
 	import ChatCheck from '../icons/ChatCheck.svelte';
 	import Knobs from '../icons/Knobs.svelte';
 	import { isTemporaryChatId } from '$lib/utils/chatId';
+	import LanguageToggle from './LanguageToggle.svelte';
 
 	const i18n = getContext('i18n');
 
@@ -113,7 +114,9 @@
 				{/if}
 
 				<div
-					class="flex-1 overflow-hidden max-w-full mt-0.5 py-0.5 pl-1 {$showSidebar ? 'ml-1' : ''}"
+					class="min-w-0 flex-1 overflow-hidden max-w-full mt-0.5 py-0.5 pl-1 {$showSidebar
+						? 'ml-1'
+						: ''}"
 				>
 					{#if chat?.id}
 						<div class="flex max-w-full min-w-0 items-center gap-2 mr-2">
@@ -162,6 +165,8 @@
 				</div>
 
 				<div class="lg:mr-1 flex flex-none items-center gap-2 self-center">
+					<LanguageToggle />
+
 					<!-- <div class="md:hidden flex self-center w-[0.0625rem] h-5 mx-2 bg-gray-300 dark:bg-stone-700" /> -->
 
 					{#if $user?.role === 'user' ? ($user?.permissions?.chat?.temporary ?? true) && !($user?.permissions?.chat?.temporary_enforced ?? false) : true}

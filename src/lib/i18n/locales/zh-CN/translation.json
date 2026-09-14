@@ -1,4 +1,6 @@
 {
+	"Switch interface language to English": "将界面语言切换为英文",
+	"Switch interface language to Simplified Chinese": "将界面语言切换为简体中文",
 	"-1 for no limit, or a positive integer for a specific limit": "-1 表示无限制，正整数表示具体限制额度",
 	"(latest)": "（最新版）",
 	"(leave blank for to use commercial endpoint)": "（留空以使用商用端点）",
