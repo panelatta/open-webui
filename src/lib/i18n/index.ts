@@ -49,7 +49,7 @@ export const initI18n = (defaultLocale?: string | undefined) => {
 	const loadResource = (language: string, namespace: string) =>
 		import(`./locales/${language}/${namespace}.json`);
 
-	i18next
+	return i18next
 		.use(resourcesToBackend(loadResource))
 		.use(LanguageDetector)
 		.init({
@@ -61,6 +61,10 @@ export const initI18n = (defaultLocale?: string | undefined) => {
 				lookupLocalStorage: 'locale'
 			},
 			fallbackLng: {
+				// English resources use empty values: fall back to the English keys,
+				// not the locale that happened to be cached when the app started.
+				en: ['en-US'],
+				'en-US': [],
 				fr: ['fr-FR'],
 				default: fallbackDefaultLocale
 			},
