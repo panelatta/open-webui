@@ -53,6 +53,7 @@ from open_webui.utils.anthropic import ANTHROPIC_VERSION, get_anthropic_models, 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.embedding_policy import EMBEDDING_DISABLED_MESSAGE
 from open_webui.utils.headers import get_custom_headers, include_user_info_headers
+from open_webui.utils.reasoning_levels import model_chain, default_config, apply_reasoning_level
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import convert_logit_bias_input_to_json
 from open_webui.utils.model_ids import strip_provider_model_prefix
@@ -203,6 +204,9 @@ def apply_model_params_to_body_responses(params: dict, form_data: dict) -> dict:
         reasoning = form_data.get("reasoning") or {}
         if not isinstance(reasoning, dict):
             reasoning = {}
+        configured_reasoning = payload.pop("reasoning", None)
+        if isinstance(configured_reasoning, dict):
+            reasoning = {**reasoning, **configured_reasoning}
         reasoning["effort"] = payload.pop("reasoning_effort")
         form_data["reasoning"] = reasoning
 
@@ -1872,6 +1876,12 @@ def convert_to_responses_payload(payload: dict) -> dict:
     if 'max_completion_tokens' in responses_payload:
         responses_payload['max_output_tokens'] = responses_payload.pop('max_completion_tokens')
 
+    if 'reasoning_effort' in responses_payload:
+        reasoning = responses_payload.get('reasoning')
+        reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
+        reasoning['effort'] = responses_payload.pop('reasoning_effort')
+        responses_payload['reasoning'] = reasoning
+
     # Remove Chat Completions-only parameters not supported by the Responses API
     for unsupported_key in (
         'stream_options',
@@ -2019,15 +2029,28 @@ async def generate_chat_completion(
 
     payload = {**form_data}
     metadata = payload.pop('metadata', None)
+    selected_reasoning_level = payload.pop('reasoning_effort_level', None)
+    payload.pop('reasoning_effort_levels', None)
 
     model_id = form_data.get('model')
     model_info = await Models.get_model_by_id(model_id)
+
+    reasoning_infos = {}
+    chain_info = model_info
+    while chain_info is not None:
+        if chain_info.id in reasoning_infos or len(reasoning_infos) >= 32:
+            raise HTTPException(status_code=400, detail='Cyclic base model chain')
+        reasoning_infos[chain_info.id] = chain_info.model_dump()
+        if not chain_info.base_model_id:
+            break
+        chain_info = await Models.get_model_by_id(chain_info.base_model_id)
+    reasoning_base_id, reasoning_config = model_chain(model_id, reasoning_infos)
 
     # Check model info and override the payload
     if model_info:
         if model_info.base_model_id:
             base_model_id = (
-                request.base_model_id if hasattr(request, 'base_model_id') else model_info.base_model_id
+                request.base_model_id if hasattr(request, 'base_model_id') else reasoning_base_id
             )  # Use request's base_model_id if available
             payload['model'] = base_model_id
             model_id = base_model_id
@@ -2061,6 +2084,13 @@ async def generate_chat_completion(
         )
 
     url, key, api_config = await get_openai_connection(idx)
+
+    if reasoning_config is None:
+        reasoning_config = default_config(reasoning_base_id, url)
+    try:
+        payload = apply_reasoning_level(payload, reasoning_config, selected_reasoning_level)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     prefix_id = api_config.get('prefix_id', None)
     payload['model'] = strip_provider_model_prefix(payload['model'], prefix_id)

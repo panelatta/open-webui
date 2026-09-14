@@ -72,6 +72,8 @@
 	import { createNoteHandler } from '../notes/utils';
 	import { getSuggestionRenderer } from '../common/RichTextInput/suggestions';
 
+	import ReasoningSelector from './ReasoningSelector.svelte';
+	export let params: any = {};
 	import InputMenu from './MessageInput/InputMenu.svelte';
 	import VoiceRecording from './MessageInput/VoiceRecording.svelte';
 	import ModelSelector from './ModelSelector.svelte';
@@ -2166,6 +2168,8 @@
 									{/if}
 								</div>
 							</div>
+
+							<ReasoningSelector {selectedModelIds} bind:params />
 
 							<div class=" flex justify-between mt-0.5 mb-2 mx-0.5 max-w-full" dir="ltr">
 								<div class="ml-1 self-end flex items-center flex-1 min-w-0">

@@ -167,6 +167,7 @@ export const playingNotificationSound = writable(false);
 export type Model = OpenAIModel | OllamaModel;
 
 type BaseModel = {
+	reasoning_effort_config?: import('$lib/utils/reasoning').ReasoningConfig | null;
 	id: string;
 	name: string;
 	info?: ModelConfig;

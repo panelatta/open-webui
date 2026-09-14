@@ -20,6 +20,7 @@ from open_webui.models.users import UserModel
 from open_webui.routers import ollama, openai
 from open_webui.socket.utils import RedisDict
 from open_webui.utils.access_control import has_access, has_base_model_access
+from open_webui.utils.reasoning_levels import model_chain, default_config
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.plugin import (
     get_functions_cache,
@@ -437,6 +438,21 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
             model['filters'].extend({**item} for item in items)
 
     log.debug('get_all_models() returned %s models', len(models))
+
+    reasoning_infos = {m.id: m.model_dump() for m in custom_models}
+    reasoning_urls = await Config.get('openai.api_base_urls') or []
+    for model in models:
+        if model.get('owned_by') == 'ollama' or model.get('pipe') or model.get('arena'):
+            continue
+        try:
+            base_id, reasoning_config = model_chain(model['id'], reasoning_infos)
+            base = base_model_lookup.get(base_id, {})
+            idx = base.get('urlIdx', 0)
+            url = reasoning_urls[idx] if isinstance(idx, int) and idx < len(reasoning_urls) else ''
+            model['reasoning_effort_config'] = reasoning_config if reasoning_config is not None else default_config(base_id, url)
+        except ValueError:
+            model['reasoning_effort_config'] = None
+
 
     models_dict = {model['id']: model for model in models}
     if isinstance(request.app.state.MODELS, RedisDict):

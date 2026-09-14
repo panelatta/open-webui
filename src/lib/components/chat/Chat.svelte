@@ -106,6 +106,7 @@
 	import { updateFolderById } from '$lib/apis/folders';
 
 	import Banner from '../common/Banner.svelte';
+	import { reasoningRequest } from '$lib/utils/reasoning';
 	import MessageInput from '$lib/components/chat/MessageInput.svelte';
 	import Messages from '$lib/components/chat/Messages.svelte';
 	import Navbar from '$lib/components/chat/Navbar.svelte';
@@ -426,6 +427,10 @@
 			...params,
 			tool_approval_mode
 		};
+
+		// Draft restoration can run before the saved chat parameters have loaded.
+		// Do not replace those parameters with a partial draft during hydration.
+		if (loading) return;
 
 		settings.set({
 			...$settings,
@@ -3545,6 +3550,7 @@
 			localStorage.token,
 			{
 				stream: stream,
+				...reasoningRequest(model, params),
 				model: model.id,
 				...(messages.length > 0 ? { messages } : {}),
 				params: {
@@ -4419,6 +4425,7 @@
 									class=" pb-2 {dragged ? 'z-0' : 'z-10'}"
 								>
 									<MessageInput
+										bind:params
 										bind:this={messageInput}
 										{history}
 										{taskIds}
@@ -4511,6 +4518,7 @@
 								{/if}
 								<div id={embedded ? messageInputDropzoneId : undefined} class="pb-2 z-10">
 									<MessageInput
+										bind:params
 										bind:this={messageInput}
 										{history}
 										{taskIds}
@@ -4572,6 +4580,7 @@
 						{:else}
 							<div class="flex items-center h-full">
 								<Placeholder
+									bind:params
 									{history}
 									bind:selectedModels
 									bind:messageInput

@@ -20,6 +20,9 @@
 	import SkillsSelector from '$lib/components/workspace/Models/SkillsSelector.svelte';
 	import FiltersSelector from '$lib/components/workspace/Models/FiltersSelector.svelte';
 	import ActionsSelector from '$lib/components/workspace/Models/ActionsSelector.svelte';
+	import ReasoningLevels from './ReasoningLevels.svelte';
+	let reasoningConfig: import('$lib/utils/reasoning').ReasoningConfig | null = null;
+	let reasoningEditor: ReasoningLevels;
 	import Capabilities from '$lib/components/workspace/Models/Capabilities.svelte';
 	import Textarea from '$lib/components/common/Textarea.svelte';
 	import AccessControl from '../common/AccessControl.svelte';
@@ -81,6 +84,7 @@
 		base_model_id: null,
 		name: '',
 		meta: {
+			reasoning_effort_config: null as import('$lib/utils/reasoning').ReasoningConfig | null,
 			// LICENSE covers this Open WebUI fallback logo.
 			// Do not alter, remove, obscure, or replace it except as LICENSE permits:
 			// https://docs.openwebui.com/license.
@@ -230,6 +234,11 @@
 
 	const submitHandler = async () => {
 		loading = true;
+		if (reasoningEditor && !reasoningEditor.validate()) {
+			toast.error($i18n.t('Invalid reasoning configuration'));
+			loading = false;
+			return;
+		}
 
 		info.id = id;
 		info.name = name;
@@ -266,6 +275,7 @@
 
 		info.access_grants = accessGrants;
 		info.meta.capabilities = capabilities;
+		info.meta.reasoning_effort_config = reasoningConfig;
 
 		if (enableDescription) {
 			info.meta.description = info.meta.description.trim() === '' ? null : info.meta.description;
@@ -405,6 +415,7 @@
 		}
 
 		if (model) {
+			reasoningConfig = structuredClone((model as any)?.meta?.reasoning_effort_config ?? null);
 			name = model.name;
 			await tick();
 
@@ -854,6 +865,12 @@
 									{/if}
 								</div>
 
+								<ReasoningLevels
+									bind:this={reasoningEditor}
+									bind:config={reasoningConfig}
+									inherited={$models.find((m) => m.id === (info.base_model_id || id))
+										?.reasoning_effort_config ?? null}
+								/>
 								<div class="flex h-7 w-full justify-between">
 									<div class="self-center text-xs text-gray-600 dark:text-gray-400">
 										{$i18n.t('Advanced Params')}

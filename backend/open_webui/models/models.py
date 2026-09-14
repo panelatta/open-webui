@@ -11,6 +11,7 @@ from open_webui.models.groups import Groups
 from open_webui.models.users import User, UserModel, UserResponse, Users
 from open_webui.utils.misc import json_text_variants
 from open_webui.utils.validate import validate_profile_image_url
+from open_webui.utils.reasoning_levels import ReasoningConfig
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import BigInteger, Boolean, Column, String, Text, cast, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,6 +79,7 @@ class ModelParams(BaseModel):
 class ModelMeta(BaseModel):
     """Metadata for a workspace model entry (profile, description, tags, capabilities)."""
 
+    reasoning_effort_config: ReasoningConfig | None = None
     profile_image_url: str | None = None
     description: str | None = Field(default=None, description='User-facing description of the model.')
     capabilities: dict | None = None
