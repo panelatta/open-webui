@@ -329,7 +329,14 @@ class SPAStaticFiles(StaticFiles):
         cls, path: str, full_path: str, stat_result, scope, status_code: int = 200
     ) -> Response:
         response = FileResponse(full_path, stat_result=stat_result, status_code=status_code)
-        if cls._should_disable_cache(path):
+        # SvelteKit emits content-addressed assets here. Only cache real,
+        # successful file responses; SPA fallbacks must never become immutable.
+        if status_code == 200 and cls._normalize_cache_path(path).startswith(
+            "_app/immutable/"
+        ):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            return response
+        if status_code >= 400 or cls._should_disable_cache(path):
             return cls._apply_no_store_headers(response)
         return response
 
@@ -382,7 +389,8 @@ class SPAStaticFiles(StaticFiles):
                     # Return 404 for javascript files
                     raise ex
                 else:
-                    return await super().get_response('index.html', scope)
+                    response = await super().get_response('index.html', scope)
+                    return self._apply_no_store_headers(response)
             else:
                 raise ex
 
