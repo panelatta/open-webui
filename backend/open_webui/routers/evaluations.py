@@ -5,6 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from open_webui.constants import ERROR_MESSAGES
+from open_webui.env import MPS_INFERENCE_LOCK
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
 from open_webui.models.config import Config
@@ -194,6 +195,7 @@ class LeaderboardResponse(BaseModel):
 
 @router.get('/leaderboard', response_model=LeaderboardResponse)
 async def get_leaderboard(
+    request: Request,
     query: Optional[str] = None,
     user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),

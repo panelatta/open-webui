@@ -207,3 +207,17 @@ async def test_chat_attachment_is_uploaded_as_hosted_file(monkeypatch):
     assert uploads == [('local-test', 2)]
     assert consumed == ['local-test']
     assert converted['input'][0]['content'][0] == {'type': 'input_file', 'file_id': 'file-hosted-test'}
+
+
+@pytest.mark.anyio
+async def test_leaderboard_search_never_uses_embedding(monkeypatch):
+    async def feedbacks(db=None):
+        return []
+
+    async def forbidden_embedding(*args, **kwargs):
+        pytest.fail('Leaderboard search must not request embeddings')
+
+    monkeypatch.setattr(evaluations.Feedbacks, 'get_feedbacks_for_leaderboard', feedbacks)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(EMBEDDING_FUNCTION=forbidden_embedding)))
+    result = await evaluations.get_leaderboard(request, query='coding', user=SimpleNamespace(), db=None)
+    assert result.entries == []

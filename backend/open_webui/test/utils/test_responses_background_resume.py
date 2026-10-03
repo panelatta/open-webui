@@ -44,7 +44,7 @@ def _completed_response_event(response_id='resp_1', sequence_number=2, text='don
     }
 
 
-async def _run_streaming_handler(monkeypatch, response, form_data=None, event_caller_result=None, events=None):
+async def _run_streaming_handler(monkeypatch, response, form_data=None, event_caller_result=None, events=None, assistant_message=None):
     events = [] if events is None else events
     upserts = []
 
@@ -170,6 +170,7 @@ async def _run_streaming_handler(monkeypatch, response, form_data=None, event_ca
         'event_emitter': event_emitter,
         'event_caller': event_caller,
         'tasks': None,
+        **({'assistant_message': assistant_message} if assistant_message else {}),
     }
 
     await middleware.streaming_chat_response_handler(response, ctx)
@@ -835,3 +836,33 @@ async def test_code_interpreter_followup_stream_error_does_not_run_contextual_re
     assert final_error['done'] is False
     assert final_error['error']['content']['code'] == 'stream_incomplete_eof'
     assert events[-1]['data']['done'] is False
+
+
+@pytest.mark.anyio
+async def test_continue_preserves_one_message_when_stream_retry_wrapper_finishes(monkeypatch):
+    """Upstream Continue coalescing must survive the local retry wrapper."""
+    prefix = {
+        'id': 'msg_prefix', 'type': 'message', 'role': 'assistant',
+        'status': 'completed', 'content': [{'type': 'output_text', 'text': 'Hello '}],
+    }
+    async def stream():
+        yield 'data: {"choices":[{"delta":{"content":"world"}}]}\n\n'
+        yield 'data: [DONE]\n\n'
+
+    events, upserts = await _run_streaming_handler(
+        monkeypatch, StreamingResponse(stream(), media_type='text/event-stream'),
+        form_data={
+            'model': 'claude-test', 'stream': True,
+            'messages': [{'role': 'user', 'content': 'Hi'}, {'role': 'assistant', 'content': 'Hello '}],
+            'metadata': {'chat_id': 'chat_1', 'message_id': 'message_1',
+                         'session_id': 'session_1', 'assistant_message_id': 'message_1', 'params': {}},
+        },
+        assistant_message={'content': 'Hello ', 'output': [prefix]},
+    )
+    completed = [e['data'] for e in events if e['type'] == 'chat:completion' and e['data'].get('done')]
+    assert len(completed) == 1
+    messages = [item for item in completed[0]['output'] if item['type'] == 'message']
+    assert len(messages) == 1
+    assert messages[0]['id'] == 'msg_prefix'
+    assert middleware.get_output_text(messages) == 'Hello world'
+    assert upserts[-1]['done'] is True

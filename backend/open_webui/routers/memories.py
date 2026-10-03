@@ -287,6 +287,7 @@ async def update_memories(
 
     operations = validate_memory_operations(form_data)
     metadata = getattr(request.state, 'metadata', {}) or {}
+    model = metadata.get('model')
     source = form_data.source or 'tool'
     for operation in operations:
         if operation.get('action') in {'add', 'replace', 'move'}:
@@ -294,7 +295,7 @@ async def update_memories(
                 'created_by': source,
                 'chat_id': metadata.get('chat_id'),
                 'message_id': metadata.get('message_id'),
-                'model': metadata.get('model'),
+                'model': model.get('id') if isinstance(model, dict) else None,
             }
 
     try:
@@ -309,7 +310,7 @@ async def update_memories(
     for result in results:
         memory = result.get('memory')
         if isinstance(memory, MemoryModel):
-            result = {**result, 'memory': memory.model_dump()}
+            result = {**result, 'memory': memory.model_dump(exclude={'meta'})}
             if result.get('status') in {'created', 'updated'}:
                 vector = await embed_memory_content(request, memory_vector_text(memory.content, memory.path), user)
                 upsert_items.append(
@@ -480,7 +481,7 @@ async def read_memory_path(
     )
     return {
         **result,
-        'memories': [memory.model_dump() for memory in result['memories']],
+        'memories': [memory.model_dump(exclude={'meta'}) for memory in result['memories']],
     }
 
 
