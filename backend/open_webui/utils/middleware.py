@@ -3352,6 +3352,11 @@ async def connect_mcp_server(
 
 
 async def process_chat_payload(request, form_data, user, metadata, model):
+    # Only tools supplied by the caller opt out of server-side resolution.
+    # Model custom_params.tools are defaults and must coexist with builtins.
+    # Capture this before apply_params_to_form_data promotes those defaults.
+    payload_tools = form_data.get('tools', None)
+
     # Ensure chat_id is always a string — external API clients may omit it.
     if not isinstance(metadata.get('chat_id'), str):
         metadata['chat_id'] = ''
@@ -3607,7 +3612,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         form_data['files'] = files
 
     variables = form_data.pop('variables', None)
-    payload_tools = form_data.get('tools', None)  # snapshot before filters
 
     # Process the form_data through the pipeline
     try:
@@ -3720,7 +3724,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     form_data.pop('folder_id', None)
 
     # If the original caller provided tools, use them as-is (skip resolution).
-    # Otherwise, save any tools that filter inlets added for merging later.
+    # Otherwise, merge model defaults and tools added by filter inlets later.
     inlet_filter_tools = None if payload_tools is not None else form_data.get('tools', None)
 
     # Mentioned skills get full content; selected/default skills can be loaded through view_skill.
