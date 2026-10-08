@@ -32,6 +32,43 @@ def test_defaults_unknown_models_and_gateway_protocol():
     assert default_config('gpt-6-astra')['options'][0]['id'] == 'low'
 
 
+@pytest.mark.parametrize('model_id,levels', [
+    ('gpt-6-astra', ['low', 'medium', 'high', 'xhigh', 'max']),
+    ('gpt-5.5', ['low', 'medium', 'high', 'xhigh']),
+    ('provider-alias', ['low', 'high', 'max']),
+    ('future-model', ['none', 'ultra', 'provider_specific']),
+    ('gpt-5-pro', ['medium', 'high', 'xhigh']),
+])
+def test_provider_levels_override_name_heuristics(model_id, levels):
+    config = default_config(model_id, model={'thinking': {'levels': levels}})
+    assert [option['id'] for option in config['options']] == levels
+    assert [option['value'] for option in config['options']] == levels
+    for level in levels:
+        assert apply_reasoning_level({}, config, level)['reasoning_effort'] == level
+
+
+def test_supported_reasoning_levels_labels_and_deduplication():
+    config = default_config('unknown', 'https://openrouter.ai/api/v1', {
+        'supported_reasoning_levels': [{'effort': 'xhigh'}, {'effort': 'max'}, {'effort': 'xhigh'}],
+    })
+    assert config['field'] == 'reasoning.effort'
+    assert [o['id'] for o in config['options']] == ['xhigh', 'max']
+    assert config['options'][0]['labels']['en-US'] == 'Extra high'
+    assert config['options'][0]['labels']['zh-CN'] == '超高'
+    assert config['default_id'] == ''
+
+
+@pytest.mark.parametrize('levels', [[], None, 'high', [None], [1], ['invalid value'], ['x' * 65], ['low'] * 33])
+def test_invalid_or_empty_advertisement_does_not_invent_presets(levels):
+    assert default_config('gpt-6-astra', model={'thinking': {'levels': levels}}) is None
+
+
+def test_provider_capability_does_not_enable_unadvertised_ultra():
+    config = default_config('gpt-6-astra', model={'thinking': {'levels': ['low', 'high', 'max']}})
+    with pytest.raises(ValueError, match='no longer exists'):
+        apply_reasoning_level({}, config, 'ultra')
+
+
 def test_preserve_summary_tools_defaults_and_remove_conflicting_alias():
     config = default_config('gpt-5.5')
     original = {'reasoning': {'effort': 'high', 'summary': 'auto'}, 'tools': [{'type': 'web_search'}]}
@@ -71,6 +108,7 @@ def test_ui_selection_map_never_leaks_upstream():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('level', ['low', 'xhigh', 'max'])
 @pytest.mark.parametrize(
     'url,api_type,field',
     [
@@ -79,7 +117,7 @@ def test_ui_selection_map_never_leaks_upstream():
         ('https://openrouter.ai/api/v1', '', 'reasoning'),
     ],
 )
-async def test_router_serializes_real_transport_after_model_defaults(monkeypatch, url, api_type, field):
+async def test_router_serializes_real_transport_after_model_defaults(monkeypatch, url, api_type, field, level):
     base = 'anthropic/claude-sonnet-5' if 'openrouter' in url else 'gpt-6-astra'
     info = SimpleNamespace(
         id='alias',
@@ -109,7 +147,7 @@ async def test_router_serializes_real_transport_after_model_defaults(monkeypatch
     monkeypatch.setattr(openai, 'get_session', AsyncMock(return_value=session))
     request = SimpleNamespace(
         state=SimpleNamespace(bypass_system_prompt=True),
-        app=SimpleNamespace(state=SimpleNamespace(OPENAI_MODELS={base: {'urlIdx': 0}})),
+        app=SimpleNamespace(state=SimpleNamespace(OPENAI_MODELS={base: {'urlIdx': 0, 'thinking': {'levels': ['low', 'xhigh', 'max']}}})),
     )
     await openai.generate_chat_completion(
         request,
@@ -117,14 +155,14 @@ async def test_router_serializes_real_transport_after_model_defaults(monkeypatch
             'model': 'alias',
             'messages': [{'role': 'user', 'content': 'hi'}],
             'stream': False,
-            'reasoning_effort_level': 'low',
+            'reasoning_effort_level': level,
         },
         SimpleNamespace(role='admin'),
     )
     sent = json.loads(session.request.call_args.kwargs['data'])
     assert sent['model'] == base
     assert 'reasoning_effort_level' not in sent
-    assert sent[field] == ({'effort': 'low', 'summary': 'auto'} if field == 'reasoning' else 'low')
+    assert sent[field] == ({'effort': level, 'summary': 'auto'} if field == 'reasoning' else level)
     assert session.request.call_args.kwargs['url'].endswith(
         '/responses' if api_type == 'responses' else '/chat/completions'
     )

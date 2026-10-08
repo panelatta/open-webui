@@ -2108,7 +2108,7 @@ async def generate_chat_completion(
     url, key, api_config = await get_openai_connection(idx)
 
     if reasoning_config is None:
-        reasoning_config = default_config(reasoning_base_id, url)
+        reasoning_config = default_config(reasoning_base_id, url, model)
     try:
         payload = apply_reasoning_level(payload, reasoning_config, selected_reasoning_level)
     except ValueError as exc:

@@ -91,27 +91,60 @@ def model_chain(model_id, infos):
     return model_id, config
 
 
-def default_config(model_id, url=''):
-    name = model_id.lower().split('/')[-1]
-    is_openrouter = urlparse(url).hostname == 'openrouter.ai'
-    # Do not guess support for chat/audio/image/non-reasoning variants.
-    if any(part in name for part in ('chat', 'audio', 'image', 'search', 'spark')):
-        return None
-    if re.match(r'^(gpt-[5-9](?:[.\-]|$)|o[134](?:-|$)|gpt-oss-)', name):
-        values = ['low', 'medium', 'high']
-        if '-pro' in name:
-            values = ['high']
-    elif name.startswith('claude-') and is_openrouter:
-        values = ['low', 'medium', 'high']
+def advertised_levels(model):
+    """Return provider effort IDs, or None when no discrete capability is advertised.
+
+    An explicit empty/invalid list disables automatic presets rather than inventing
+    three levels. Values remain provider-owned; labels never change request values.
+    """
+    thinking = model.get('thinking')
+    if isinstance(thinking, dict) and 'levels' in thinking:
+        levels = thinking['levels']
+    elif 'supported_reasoning_levels' in model:
+        levels = model['supported_reasoning_levels']
+        if isinstance(levels, list):
+            levels = [item.get('effort') if isinstance(item, dict) else item for item in levels]
     else:
         return None
-    names = {'low': '轻量', 'medium': '标准', 'high': '深入'}
+    if not isinstance(levels, list) or len(levels) > 32:
+        return []
+    if any(not isinstance(v, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', v) for v in levels):
+        return []
+    return list(dict.fromkeys(levels))
+
+
+def default_config(model_id, url='', model=None):
+    name = model_id.lower().split('/')[-1]
+    is_openrouter = urlparse(url).hostname == 'openrouter.ai'
+    values = advertised_levels(model or {})
+    if values is None:
+        # Only use legacy conservative defaults when the provider has no metadata.
+        if any(part in name for part in ('chat', 'audio', 'image', 'search', 'spark')):
+            return None
+        if re.match(r'^(gpt-[5-9](?:[.\-]|$)|o[134](?:-|$)|gpt-oss-)', name):
+            values = ['high'] if '-pro' in name else ['low', 'medium', 'high']
+        elif name.startswith('claude-') and is_openrouter:
+            values = ['low', 'medium', 'high']
+        else:
+            return None
+    if not values:
+        return None
+    names = {
+        'none': ('None', '无'),
+        'minimal': ('Minimal', '极低'),
+        'low': ('Low', '轻量'),
+        'medium': ('Medium', '标准'),
+        'high': ('High', '深入'),
+        'xhigh': ('Extra high', '超高'),
+        'max': ('Max', '最大'),
+        'ultra': ('Ultra', '极致'),
+    }
     return {
         'enabled': True,
         'field': 'reasoning.effort' if is_openrouter else 'reasoning_effort',
         'default_id': '',
         'options': [
-            {'id': v, 'labels': {'en-US': v.capitalize(), 'zh-CN': names[v]}, 'value': v, 'bindings': {}}
+            {'id': v, 'labels': {'en-US': names.get(v, (v, v))[0], 'zh-CN': names.get(v, (v, v))[1]}, 'value': v, 'bindings': {}}
             for v in values
         ],
     }

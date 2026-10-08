@@ -453,7 +453,7 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
             base = base_model_lookup.get(base_id, {})
             idx = base.get('urlIdx', 0)
             url = reasoning_urls[idx] if isinstance(idx, int) and idx < len(reasoning_urls) else ''
-            model['reasoning_effort_config'] = reasoning_config if reasoning_config is not None else default_config(base_id, url)
+            model['reasoning_effort_config'] = reasoning_config if reasoning_config is not None else default_config(base_id, url, base)
         except ValueError:
             model['reasoning_effort_config'] = None
 

@@ -28,4 +28,18 @@ describe('reasoning levels', () => {
 		});
 		expect(reasoningRequest({ ...model, reasoning_effort_config: null }, params)).toEqual({});
 	});
+	it('preserves provider-specific choices without imposing a three-level ladder', () => {
+		for (const levels of [['low', 'medium', 'high', 'xhigh', 'max'], ['low', 'high', 'max']]) {
+			const config = {
+				...reasoningTemplate(),
+				options: levels.map((id) => ({ id, value: id, labels: {}, bindings: {} }))
+			};
+			const model = { id: 'alias', reasoning_effort_config: config };
+			for (const level of levels) {
+				expect(reasoningRequest(model, { reasoning_effort_levels: { alias: level } })).toEqual({
+					reasoning_effort_level: level
+				});
+			}
+		}
+	});
 });
