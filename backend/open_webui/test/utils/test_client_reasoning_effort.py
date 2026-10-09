@@ -435,3 +435,20 @@ async def test_server_default_is_not_mistaken_for_explicit_client_effort(monkeyp
         "medium",
         client_supplied=False,
     )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"supported_parameters": ["tools", "temperature"]},
+        {"supported_parameters": []},
+        {"info": {"meta": {"capabilities": {"reasoning": False}}}},
+    ],
+)
+def test_explicit_nonreasoning_capability_wins_over_family_name(model):
+    assert (
+        apply_client_reasoning_effort(
+            {"reasoning_effort": "xhigh"}, None, "claude-3-haiku", model, "", "xhigh"
+        )
+        == {}
+    )

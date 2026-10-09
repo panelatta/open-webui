@@ -220,6 +220,11 @@ def apply_client_reasoning_effort(payload, config, model_id, model, url, request
         meta = (model.get('info') or {}).get('meta') or {}
         capabilities = meta.get('capabilities') or {}
         supported = model.get('supported_parameters') or []
+        if capabilities.get('reasoning') is False or (
+            isinstance(model.get('supported_parameters'), list)
+            and not any(p in supported for p in ('reasoning', 'reasoning_effort'))
+        ):
+            return payload
         name = model_id.lower().split('/')[-1]
         reasoning_model = (
             capabilities.get('reasoning') is True
