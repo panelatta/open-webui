@@ -272,3 +272,13 @@ def apply_client_reasoning_effort(payload, config, model_id, model, url, request
         set_path(payload, path, None)
     effective = {'enabled': True, 'field': field, 'default_id': '', 'options': [selected]}
     return apply_reasoning_level(payload, effective, selected['id'])
+
+
+def client_has_reasoning_effort(form_data):
+    """Check before server defaults are merged into the public chat request."""
+    params = form_data.get('params') or {}
+    custom = params.get('custom_params') or {}
+    return any(
+        isinstance(source, dict) and source.get('reasoning_effort') is not None
+        for source in (form_data, params, custom)
+    )

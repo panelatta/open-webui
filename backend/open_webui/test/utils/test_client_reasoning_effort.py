@@ -14,6 +14,7 @@ from open_webui.utils.reasoning_capabilities import (
 from open_webui.utils.reasoning_levels import (
     advertised_levels,
     apply_client_reasoning_effort,
+    client_has_reasoning_effort,
     default_config,
 )
 
@@ -309,7 +310,15 @@ async def test_manual_model_allowlist_retains_provider_metadata_and_offline_entr
     ],
 )
 async def test_router_serializes_relay_params_after_defaults(
-    monkeypatch, api_type, url, model_id, levels, requested, expected
+    monkeypatch,
+    api_type,
+    url,
+    model_id,
+    levels,
+    requested,
+    expected,
+    *,
+    client_supplied=True,
 ):
     glm = "glm" in model_id
     config = (
@@ -366,8 +375,10 @@ async def test_router_serializes_relay_params_after_defaults(
     session = SimpleNamespace(request=AsyncMock(return_value=response))
     monkeypatch.setattr(openai, "get_session", AsyncMock(return_value=session))
     request = SimpleNamespace(
-        state=SimpleNamespace(bypass_system_prompt=True),
-        app=SimpleNamespace(state=SimpleNamespace(OPENAI_MODELS={})),
+        state=SimpleNamespace(
+            bypass_system_prompt=True, client_reasoning_effort_supplied=client_supplied
+        ),
+        app=SimpleNamespace(state=SimpleNamespace(OPENAI_MODELS={model_id: model})),
     )
     body = apply_params_to_form_data(
         {
@@ -387,4 +398,40 @@ async def test_router_serializes_relay_params_after_defaults(
         assert "reasoning" not in sent
     else:
         assert sent["reasoning"] == {"effort": expected, "summary": "auto"}
-    refresh.assert_awaited_once()
+    if client_supplied:
+        refresh.assert_awaited_once()
+    else:
+        refresh.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ({}, False),
+        ({"params": {}}, False),
+        ({"params": {"reasoning_effort": None}}, False),
+        ({"reasoning_effort": "low"}, True),
+        ({"params": {"reasoning_effort": "low"}}, True),
+        ({"params": {"reasoning_effort": ""}}, True),
+        ({"params": {"custom_params": {"reasoning_effort": "max"}}}, True),
+        ({"params": {"reasoning": {"effort": "high"}}}, False),
+    ],
+)
+def test_explicit_client_input_is_captured_before_model_defaults(body, expected):
+    assert client_has_reasoning_effort(body) is expected
+
+
+@pytest.mark.asyncio
+async def test_server_default_is_not_mistaken_for_explicit_client_effort(monkeypatch):
+    # medium is intentionally absent from the mock catalog: a model-owned
+    # default must not be silently remapped or require an extra discovery call.
+    await test_router_serializes_relay_params_after_defaults(
+        monkeypatch,
+        "responses",
+        "https://provider/v1",
+        "gpt-6-astra",
+        ["low", "high"],
+        "medium",
+        "medium",
+        client_supplied=False,
+    )

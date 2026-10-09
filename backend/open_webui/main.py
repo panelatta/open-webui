@@ -257,6 +257,7 @@ from open_webui.utils.middleware import (
     build_responses_reasoning_placeholder,
 )
 from open_webui.utils.misc import get_response_error_detail, merge_model_params
+from open_webui.utils.reasoning_levels import client_has_reasoning_effort
 from open_webui.utils.model_ids import strip_provider_model_prefix
 from open_webui.utils.models import (
     check_model_access,
@@ -1255,6 +1256,9 @@ async def chat_completion(
 
         # Read before the fallback below can rebind model to a different one.
         model_capabilities = ((model.get('info') or {}).get('meta') or {}).get('capabilities') or {}
+
+        # Distinguish explicit native-client input from server-owned defaults.
+        request.state.client_reasoning_effort_supplied = client_has_reasoning_effort(form_data)
 
         # Model params: global defaults as base, per-model overrides win
         default_model_params = copy.deepcopy(await Config.get('models.default_params', {}) or {})

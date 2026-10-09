@@ -2053,7 +2053,11 @@ async def generate_chat_completion(
     payload = {**form_data}
     metadata = payload.pop('metadata', None)
     selected_reasoning_level = payload.pop('reasoning_effort_level', None)
-    client_effort_supplied = 'reasoning_effort' in payload and selected_reasoning_level is None
+    client_effort_supplied = (
+        'reasoning_effort' in payload
+        and getattr(request.state, 'client_reasoning_effort_supplied', True)
+        and selected_reasoning_level is None
+    )
     client_effort = payload.get('reasoning_effort')
     payload.pop('reasoning_effort_levels', None)
 
