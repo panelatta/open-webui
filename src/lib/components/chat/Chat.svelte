@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { mergeStatus } from '$lib/utils/status';
 	import { v4 as uuidv4 } from 'uuid';
 	import { toast } from 'svelte-sonner';
 
@@ -1224,7 +1225,7 @@
 				const data = event?.data?.data ?? null;
 
 				if (type === 'status') {
-					message.statusHistory = [...(message?.statusHistory ?? []), data];
+					message.statusHistory = mergeStatus(message?.statusHistory ?? [], data);
 				} else if (type === 'context_compaction') {
 					handleContextCompactionStatus(data);
 				} else if (type === 'chat:active') {

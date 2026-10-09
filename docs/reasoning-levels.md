@@ -83,3 +83,33 @@ require the explicit web preset protocol.
 This change does not add a native picker to Open Relay or change its chat
 parameter persistence: its unknown-key handling still does not round-trip the
 web client's per-model selection map.
+
+
+## Display-only generation identity
+
+Each foreground chat generation emits one updatable `generation_config` status
+with the resolved base model and reasoning effort. The status is shown by both
+the web chat and Open Relay's existing status-history UI; it is not an assistant
+message or a reasoning/output item. The initial value is taken after alias
+resolution, client fallback, model defaults and transport conversion.
+
+Responses API `response.created` metadata can confirm the actual effort even
+when the request omitted it. Response-reported values take precedence over
+request values. Otherwise, the display uses an explicit request value or a
+provider-advertised default that belongs to its supported list (labeled
+`provider default`). Non-reasoning models show `none`. If neither the request
+nor the provider exposes a concrete value, the status ends as `unconfirmed`.
+No effort is injected or changed just to populate the display.
+
+A stable status ID replaces the pending entry in the database and web UI; Open
+Relay already replaces pending statuses with the same action. Tools and retries
+reuse the message's status instead of appending duplicates. New turns,
+regeneration and separate model responses each have their own status. Background
+title/tag/memory tasks do not emit it. Only trusted metadata established by the
+authenticated chat endpoint can address a chat or socket room.
+
+The display is stored only in `statusHistory`. Database replay already uses a
+whitelist that excludes it; message cleanup and the final provider request also
+strip this display field. Neither message content, reasoning output, subsequent
+model context nor memory extraction receives the status text. Raw OpenAI API
+calls without chat context keep their original response stream unchanged.

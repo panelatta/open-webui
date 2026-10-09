@@ -53,6 +53,7 @@ from open_webui.utils.anthropic import ANTHROPIC_VERSION, get_anthropic_models, 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.embedding_policy import EMBEDDING_DISABLED_MESSAGE
 from open_webui.utils.headers import get_custom_headers, include_user_info_headers
+from open_webui.utils.generation_status import start_generation_status
 from open_webui.utils.reasoning_capabilities import supplement_reasoning_capabilities
 from open_webui.utils.reasoning_levels import model_chain, default_config, apply_reasoning_level, apply_client_reasoning_effort
 from open_webui.utils.json_codec import JSONCodec
@@ -2220,6 +2221,9 @@ async def generate_chat_completion(
 
     def build_openai_request(base_payload: dict) -> tuple[str, str]:
         outbound_payload = copy.deepcopy(base_payload)
+        for message in outbound_payload.get("messages", []):
+            if isinstance(message, dict):
+                message.pop("statusHistory", None)
 
         def apply_background_resume_flags(payload: dict) -> dict:
             if payload.get('stream') and responses_background_resume_enabled(
@@ -2279,6 +2283,9 @@ async def generate_chat_completion(
 
     requested_model = payload.get("model")
     request_url, payload = build_openai_request(payload)
+    status_payload = json.loads(payload)
+    status_payload.setdefault("model", requested_model)
+    generation_status = await start_generation_status(request, metadata, status_payload, model)
 
     r = None
     streaming = False
@@ -2352,7 +2359,7 @@ async def generate_chat_completion(
                     response_headers['x-openwebui-openai-url-idx'] = str(idx)
                     response_headers['x-openwebui-openai-base-url'] = url
                 return StreamingResponse(
-                    stream_wrapper(r),
+                    generation_status.wrap(stream_wrapper(r)) if generation_status else stream_wrapper(r),
                     status_code=r.status,
                     headers=response_headers,
                 )
@@ -2406,6 +2413,9 @@ async def generate_chat_completion(
                 else:
                     return PlainTextResponse(status_code=r.status, content=response)
 
+            if generation_status:
+                await generation_status.observe(response)
+
             # Convert Responses API result to simple format
             if is_responses and isinstance(response, dict):
                 response = convert_responses_result(response)
@@ -2420,6 +2430,8 @@ async def generate_chat_completion(
         )
     finally:
         if not streaming:
+            if generation_status:
+                await generation_status.finish()
             await cleanup_response(r)
 
 

@@ -365,6 +365,8 @@ async def test_router_serializes_relay_params_after_defaults(
     )
     monkeypatch.setattr(openai, "cleanup_response", AsyncMock())
     model = {"id": model_id, "urlIdx": 0, "thinking": {"levels": levels}}
+    start_status = AsyncMock(return_value=None)
+    monkeypatch.setattr(openai, 'start_generation_status', start_status)
     refresh = AsyncMock(return_value={"data": [model]})
     monkeypatch.setattr(openai, "get_all_models", refresh)
     response = SimpleNamespace(
@@ -392,6 +394,10 @@ async def test_router_serializes_relay_params_after_defaults(
     await openai.generate_chat_completion(request, body, SimpleNamespace(role="admin"))
     sent = json.loads(session.request.call_args.kwargs["data"])
     assert sent["model"] == model_id
+    displayed_payload = start_status.call_args.args[2]
+    assert displayed_payload == sent
+    assert displayed_payload['model'] == model_id
+
     assert "reasoning_effort" not in sent
     assert "reasoning_effort_level" not in sent
     if expected is None:

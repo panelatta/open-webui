@@ -3284,7 +3284,7 @@ def process_messages_with_output(
                 continue
 
         clean_message = dict(message)
-        for key in ('id', 'files', 'output', 'model', 'contextSummary', 'context_summary', 'usage'):
+        for key in ('id', 'files', 'output', 'model', 'contextSummary', 'context_summary', 'usage', 'statusHistory'):
             clean_message.pop(key, None)
         processed.append(clean_message)
 
