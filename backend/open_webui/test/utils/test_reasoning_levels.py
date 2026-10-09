@@ -156,6 +156,7 @@ async def test_router_serializes_real_transport_after_model_defaults(monkeypatch
             'messages': [{'role': 'user', 'content': 'hi'}],
             'stream': False,
             'reasoning_effort_level': level,
+            'reasoning_effort': 'invalid-client-default',
         },
         SimpleNamespace(role='admin'),
     )

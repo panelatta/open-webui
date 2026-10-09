@@ -53,7 +53,8 @@ from open_webui.utils.anthropic import ANTHROPIC_VERSION, get_anthropic_models, 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.embedding_policy import EMBEDDING_DISABLED_MESSAGE
 from open_webui.utils.headers import get_custom_headers, include_user_info_headers
-from open_webui.utils.reasoning_levels import model_chain, default_config, apply_reasoning_level
+from open_webui.utils.reasoning_capabilities import supplement_reasoning_capabilities
+from open_webui.utils.reasoning_levels import model_chain, default_config, apply_reasoning_level, apply_client_reasoning_effort
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import convert_logit_bias_input_to_json
 from open_webui.utils.model_ids import strip_provider_model_prefix
@@ -1093,6 +1094,22 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         raise HTTPException(status_code=401, detail=ERROR_MESSAGES.OPENAI_NOT_FOUND)
 
 
+async def get_configured_models_request(request, url, key, user, config):
+    """Keep the manual allowlist while fetching real metadata for its entries."""
+    response = await get_models_request(request, url, key, user=user, config=config)
+    model_ids = config.get('model_ids') or []
+    if not model_ids:
+        return response
+    data = response if isinstance(response, list) else (response or {}).get('data', [])
+    upstream = {m['id']: m for m in data if isinstance(m, dict) and isinstance(m.get('id'), str)} if isinstance(data, list) else {}
+    return {'data': [
+        upstream.get(model_id, {
+            'id': model_id, 'name': model_id, 'owned_by': 'openai', 'openai': {'id': model_id},
+        })
+        for model_id in model_ids
+    ]}
+
+
 async def get_all_models_responses(request: Request, user: UserModel) -> list:
     enable_openai_api, api_base_urls, api_keys, api_configs = await get_openai_runtime_config()
     if not enable_openai_api:
@@ -1115,27 +1132,9 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
             )
 
             enable = api_config.get('enable', True)
-            model_ids = api_config.get('model_ids', [])
 
             if enable:
-                if len(model_ids) == 0:
-                    request_tasks.append(get_models_request(request, url, api_keys[idx], user=user, config=api_config))
-                else:
-                    model_list = {
-                        'object': 'list',
-                        'data': [
-                            {
-                                'id': model_id,
-                                'name': model_id,
-                                'owned_by': 'openai',
-                                'openai': {'id': model_id},
-                                'urlIdx': idx,
-                            }
-                            for model_id in model_ids
-                        ],
-                    }
-
-                    request_tasks.append(asyncio.ensure_future(asyncio.sleep(0, model_list)))
+                request_tasks.append(get_configured_models_request(request, url, api_keys[idx], user, api_config))
             else:
                 request_tasks.append(asyncio.ensure_future(asyncio.sleep(0, None)))
 
@@ -1158,6 +1157,8 @@ async def get_all_models_responses(request: Request, user: UserModel) -> list:
             if not isinstance(model_list, list):
                 # Catch non-list responses
                 model_list = []
+
+            await supplement_reasoning_capabilities(model_list)
 
             for model in model_list:
                 # Remove name key if its value is None #16689
@@ -2052,6 +2053,8 @@ async def generate_chat_completion(
     payload = {**form_data}
     metadata = payload.pop('metadata', None)
     selected_reasoning_level = payload.pop('reasoning_effort_level', None)
+    client_effort_supplied = 'reasoning_effort' in payload and selected_reasoning_level is None
+    client_effort = payload.get('reasoning_effort')
     payload.pop('reasoning_effort_levels', None)
 
     model_id = form_data.get('model')
@@ -2090,6 +2093,10 @@ async def generate_chat_completion(
     else:
         await check_model_access(user, None, bypass_filter)
 
+    if client_effort_supplied:
+        # Use the provider catalog cache TTL, not an indefinitely stale app-state entry.
+        catalog = await get_all_models(request, user=user)
+        request.app.state.OPENAI_MODELS = {m['id']: m for m in catalog['data']}
     # Check if model is already in app state cache to avoid expensive get_all_models() call
     models = request.app.state.OPENAI_MODELS
     if not models or model_id not in models:
@@ -2110,7 +2117,14 @@ async def generate_chat_completion(
     if reasoning_config is None:
         reasoning_config = default_config(reasoning_base_id, url, model)
     try:
-        payload = apply_reasoning_level(payload, reasoning_config, selected_reasoning_level)
+        if client_effort_supplied:
+            payload = apply_client_reasoning_effort(
+                payload, reasoning_config,
+                strip_provider_model_prefix(reasoning_base_id, api_config.get('prefix_id')),
+                model, url, client_effort
+            )
+        else:
+            payload = apply_reasoning_level(payload, reasoning_config, selected_reasoning_level)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

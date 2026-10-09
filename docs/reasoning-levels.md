@@ -34,3 +34,52 @@ Official parameter references:
 - https://docs.anthropic.com/en/docs/build-with-claude/effort
 
 Deployment must use a complete local frontend build. The existing memory-only embedding policy, hosted chat file uploads, Responses retry/background resume and account language settings remain in place.
+
+## Native clients (Open Relay)
+
+Open Relay's Chat Settings → Advanced Params → Reasoning sends
+`params.reasoning_effort`. The server now translates this explicit value when
+no `reasoning_effort_level` is supplied. An explicit web preset (including the
+empty model-default selection) retains priority. Omitting effort preserves
+existing model defaults.
+
+Available values come from the upstream catalog's `thinking.levels`,
+`supported_reasoning_levels`, or OpenRouter's `reasoning.supported_efforts`.
+Manual connection model lists remain allowlists but now fetch upstream metadata.
+The compatibility path refreshes through the existing model-catalog cache on
+each explicit effort request; it does not reuse app-state metadata indefinitely.
+It never uses the legacy model-name low/medium/high list as proof of support.
+Every advertised value is accepted, even when saved web presets contain only
+a subset. Whitespace and case are normalized back to the provider's exact value.
+
+The connected Abliteration gateway does not publish effort enums. For upstream
+catalog entries identifying `abliterated-model-large-v2` or
+`abliterated-model-large`, fetch
+[the provider's capability document](https://docs.abliteration.ai/capabilities/thinking.md)
+and parse its model-specific distinct modes, with a five-minute cache. This is
+a documentation source, not a machine-readable model API. No effort enumeration
+is hardcoded. Ambiguous/changed document syntax or fetch failure cannot manufacture
+capabilities; explicit effort requests fail when a reasoning model has no
+verified list. A machine-readable enum takes precedence, including an empty list.
+The public documentation fetch receives no connection credentials.
+
+Recognized values pass through unchanged. Named custom presets are also accepted
+if their actual effort value is advertised. Otherwise GPT/o-series and Claude
+choose advertised `xhigh`, then advertised `high`; GLM chooses advertised
+`max`. If the requested fallback is unavailable, return a clear error listing
+the actual options instead of sending an unsupported value. Other model families
+require a recognized value. Non-reasoning models such as GPT-4o discard the
+client effort override; they do not acquire reasoning from a previous chat's
+defaults. Disabled controls stay disabled.
+
+Protocol mapping uses the model's configured effort field/bindings when present,
+otherwise `reasoning.effort` for OpenRouter and `reasoning_effort` for
+OpenAI-compatible Chat Completions. Responses conversion produces
+`reasoning.effort`. Model-owned default presets cannot override an explicit
+client choice. Conflicting effort fields/stale bindings are cleared; summary,
+tools and other unrelated fields remain. Budget-based custom presets still
+require the explicit web preset protocol.
+
+This change does not add a native picker to Open Relay or change its chat
+parameter persistence: its unknown-key handling still does not round-trip the
+web client's per-model selection map.

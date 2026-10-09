@@ -104,6 +104,8 @@ def advertised_levels(model):
         levels = model['supported_reasoning_levels']
         if isinstance(levels, list):
             levels = [item.get('effort') if isinstance(item, dict) else item for item in levels]
+    elif isinstance(model.get('reasoning'), dict) and 'supported_efforts' in model['reasoning']:
+        levels = model['reasoning']['supported_efforts']
     else:
         return None
     if not isinstance(levels, list) or len(levels) > 32:
@@ -199,3 +201,74 @@ def validate_thinking_budget(payload):
         limit = payload.get('max_tokens', payload.get('max_completion_tokens'))
         if limit is not None and budget >= limit:
             raise ValueError('Thinking budget must be smaller than max_tokens')
+
+
+def apply_client_reasoning_effort(payload, config, model_id, model, url, requested):
+    """Translate legacy client effort using provider-owned levels, never name guesses.
+
+    Call only for an explicit client reasoning_effort without a web preset ID.
+    Saved presets provide protocol/bindings, not the list of valid effort values.
+    """
+    payload.pop('reasoning_effort', None)
+    if config is not None and not config.get('enabled'):
+        return payload
+
+    levels = advertised_levels(model)
+    if levels is None:
+        # Catalogs without a reasoning capability must not acquire one from a
+        # client default (e.g. switching from GPT-5 to GPT-4o in Open Relay).
+        meta = (model.get('info') or {}).get('meta') or {}
+        capabilities = meta.get('capabilities') or {}
+        supported = model.get('supported_parameters') or []
+        name = model_id.lower().split('/')[-1]
+        reasoning_model = (
+            capabilities.get('reasoning') is True
+            or any(p in supported for p in ('reasoning', 'reasoning_effort'))
+            or re.match(r'^(gpt-[5-9](?:[.\-]|$)|o[134](?:-|$)|claude-|.*glm)', name)
+            or model.get('name', '').startswith('abliterated-model')
+        )
+        if reasoning_model:
+            raise ValueError('Upstream reasoning levels are unavailable; refresh the model list and retry')
+        return payload
+    if not levels:
+        return payload
+
+    if not isinstance(requested, str):
+        raise ValueError('reasoning_effort must be a string')  # noqa: TRY004 - router maps validation to HTTP 400
+    normalized = requested.strip().casefold()
+    value = next((v for v in levels if v.casefold() == normalized), None)
+    options = (config or {}).get('options', [])
+    if value is None:
+        # Allow named web presets only when their actual value is advertised.
+        option = next((o for o in options if o['id'].casefold() == normalized and o['value'] in levels), None)
+        if option is not None:
+            value = option['value']
+    if value is None:
+        name = model_id.lower().split('/')[-1]
+        provider_name = str(model.get('name') or model.get('display_name') or '').lower()
+        if 'glm' in name or provider_name.startswith('abliterated-model-large'):
+            preferred = ('max',)
+        elif re.match(r'^(gpt-|o[134](?:-|$)|claude-)', name):
+            preferred = ('xhigh', 'high')
+        else:
+            preferred = ()
+        value = next((v for preferred_value in preferred for v in levels if v.casefold() == preferred_value), None)
+        if value is None:
+            raise ValueError('Unrecognized reasoning_effort; upstream supports: ' + ', '.join(levels))
+
+    # Reuse saved bindings/field when they correspond to the provider value.
+    option = next((o for o in options if o['value'] == value), None)
+    field = (config or {}).get('field') or (
+        'reasoning.effort' if urlparse(url).hostname == 'openrouter.ai' else 'reasoning_effort'
+    )
+    if field not in ('reasoning_effort', 'reasoning.effort', 'output_config.effort'):
+        raise ValueError('This model uses thinking budgets; select an explicit web reasoning preset')
+    selected = deepcopy(option) if option is not None else {
+        'id': value, 'value': value, 'labels': {}, 'bindings': {},
+    }
+    # Clear bindings owned by all saved presets before applying one choice.
+    # Do not append to a full saved option list when the upstream adds a value.
+    for path in {field} | {p for o in options for p in o.get('bindings', {})}:
+        set_path(payload, path, None)
+    effective = {'enabled': True, 'field': field, 'default_id': '', 'options': [selected]}
+    return apply_reasoning_level(payload, effective, selected['id'])
