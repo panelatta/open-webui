@@ -3559,11 +3559,12 @@
 	"chatManager.deleteWarning": "Deleted chats cannot be recovered. Any running generations in these chats will be stopped.",
 	"chatManager.destination": "Destination: {{folder}}",
 	"chatManager.moveWarning": "Moving clears pinning. Moving into a folder also unarchives the chats.",
-	"chatManager.archiveWarning": "Archiving stops any running generations in these chats. You can unarchive them later.",
+	"chatManager.archiveWarning": "Archiving moves these chats out of their folders and stops any running generations. You can unarchive them later.",
 	"chatManager.result": "Completed: {{succeeded}} succeeded, {{failed}} failed.",
 	"chatManager.wait": "Processing selected chats. Please wait.",
 	"chatManager.uncertain": "The request did not complete normally. Some chats may have changed. Review the refreshed list before trying again.",
 	"chatManager.refreshFailed": "The action completed, but the sidebar could not refresh. Please reload the page.",
 	"chatManager.page": "Page {{page}} of {{pages}} · {{total}} chats",
-	"chatManager.selectionHint": "Select all applies to the current page only. Changing the page or filters clears your selection."
+	"chatManager.selectionHint": "Select all applies to the current page only. Changing the page or filters clears your selection.",
+	"chatManager.unarchiveWarning": "Unarchiving moves these chats out of their folders. You can move them into a folder afterwards."
 }

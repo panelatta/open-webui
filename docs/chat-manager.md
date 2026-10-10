@@ -8,7 +8,7 @@ archived chats. Internal agent chats are excluded.
 - Select individual rows or the current page. Changing filters or pages clears selection.
 - Move selected chats into a folder or out of folders, archive, unarchive, or delete.
 - Each operation confirms the selected count. Delete is irreversible and stops active
-  generation. Archiving also stops active generation.
+  generation. Archiving also stops active generation. Both archive transitions\n  follow the existing behavior of moving affected chats out of folders.
 - Moving follows the existing behavior: it clears pinning, and moving into a folder
   unarchives the chat.
 - Failed items are reported individually and remain selected when visible. Successful

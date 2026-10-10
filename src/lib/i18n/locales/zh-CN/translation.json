@@ -3556,11 +3556,12 @@
 	"chatManager.deleteWarning": "删除后无法恢复，这些对话中正在进行的生成任务也会停止。",
 	"chatManager.destination": "目标位置：{{folder}}",
 	"chatManager.moveWarning": "移动会取消置顶；移入文件夹还会取消归档。",
-	"chatManager.archiveWarning": "归档会停止这些对话中正在进行的生成任务，之后可取消归档。",
+	"chatManager.archiveWarning": "归档会将这些对话移出文件夹，并停止正在进行的生成任务；之后可取消归档。",
 	"chatManager.result": "操作完成：成功 {{succeeded}} 个，失败 {{failed}} 个。",
 	"chatManager.wait": "正在处理所选对话，请稍候。",
 	"chatManager.uncertain": "请求未正常完成，部分对话可能已经变更。请检查刷新后的列表，再决定是否重试。",
 	"chatManager.refreshFailed": "操作已完成，但侧栏刷新失败，请重新加载页面。",
 	"chatManager.page": "第 {{page}} / {{pages}} 页 · 共 {{total}} 个对话",
-	"chatManager.selectionHint": "全选仅选择当前页；切换页码或筛选条件会清空选择。"
+	"chatManager.selectionHint": "全选仅选择当前页；切换页码或筛选条件会清空选择。",
+	"chatManager.unarchiveWarning": "取消归档会将这些对话移出原文件夹，之后可重新移动到文件夹。"
 }

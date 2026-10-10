@@ -196,6 +196,8 @@
 			<p>{$i18n.t('chatManager.moveWarning')}</p>
 		{:else if pendingAction === 'archive'}
 			<p>{$i18n.t('chatManager.archiveWarning')}</p>
+		{:else if pendingAction === 'unarchive'}
+			<p>{$i18n.t('chatManager.unarchiveWarning')}</p>
 		{/if}
 	</div>
 </ConfirmDialog>
@@ -215,7 +217,11 @@
 		</button>
 		<h1 class="text-lg font-semibold">{$i18n.t('Manage Chats')}</h1>
 	</header>
-	<main class="flex-1 overflow-y-auto p-4 sm:p-6">
+	<section
+		data-testid="chat-manager"
+		aria-label={$i18n.t('Manage Chats')}
+		class="flex-1 overflow-y-auto p-4 sm:p-6"
+	>
 		<div class="mx-auto max-w-6xl space-y-5">
 			<p class="text-sm text-gray-500 dark:text-gray-400">{$i18n.t('chatManager.description')}</p>
 			<div class="flex flex-wrap gap-3">
@@ -234,10 +240,11 @@
 				<label>
 					<span class="mb-1 block text-xs text-gray-500">{$i18n.t('Status')}</span>
 					<select
+						aria-label={$i18n.t('Status')}
 						bind:value={archived}
 						on:change={() => filterChanged()}
 						disabled={busy}
-						class="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-900"
+						class="rounded-xl border border-gray-200 bg-white pl-3 pr-8 py-2 text-sm dark:border-gray-700 dark:bg-gray-900"
 					>
 						<option value="false">{$i18n.t('chatManager.unarchived')}</option>
 						<option value="true">{$i18n.t('Archived')}</option>
@@ -248,10 +255,11 @@
 					<label class="max-w-full">
 						<span class="mb-1 block text-xs text-gray-500">{$i18n.t('Folder')}</span>
 						<select
+							aria-label={$i18n.t('Folder')}
 							bind:value={folder}
 							on:change={() => filterChanged()}
 							disabled={busy || !!folderError}
-							class="max-w-full rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-900"
+							class="max-w-full rounded-xl border border-gray-200 bg-white pl-3 pr-8 py-2 text-sm dark:border-gray-700 dark:bg-gray-900"
 						>
 							<option value="all">{$i18n.t('All folders')}</option>
 							<option value="">{$i18n.t('No folder')}</option>
@@ -268,7 +276,7 @@
 			</div>
 			{#if folderError}<p role="alert" class="text-sm text-red-600">{folderError}</p>{/if}
 			<div
-				class="flex flex-wrap items-center gap-2 rounded-2xl bg-gray-50 p-3 dark:bg-gray-900"
+				class="sticky top-0 z-10 flex flex-wrap items-center gap-2 rounded-2xl bg-gray-50 p-3 dark:bg-gray-900"
 				aria-busy={busy}
 			>
 				<span class="mr-auto text-sm font-medium" aria-live="polite"
@@ -282,7 +290,7 @@
 						aria-label={$i18n.t('chatManager.moveTo')}
 						bind:value={targetFolder}
 						disabled={busy || !!folderError}
-						class="max-w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm dark:border-gray-700 dark:bg-gray-850"
+						class="max-w-full rounded-lg border border-gray-200 bg-white pl-2 pr-8 py-1.5 text-sm dark:border-gray-700 dark:bg-gray-850"
 					>
 						<option value="">{$i18n.t('No folder')}</option>
 						{#each folderList as entry}<option value={entry.id}>{folderName(entry.id)}</option
@@ -419,7 +427,7 @@
 			</div>
 			<p class="text-xs text-gray-500">{$i18n.t('chatManager.selectionHint')}</p>
 		</div>
-	</main>
+	</section>
 </div>
 
 <style>
