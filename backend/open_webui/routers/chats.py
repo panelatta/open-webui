@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from uuid import uuid4
+from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from open_webui.config import ENABLE_ADMIN_CHAT_ACCESS, ENABLE_ADMIN_EXPORT
@@ -25,6 +26,7 @@ from open_webui.models.chats import (
     ChatTitleIdResponse,
     ChatUsageStatsListResponse,
     MessageStats,
+    ManagedChatListResponse,
     chat_search_content_query,
     chat_search_terms,
 )
@@ -41,7 +43,7 @@ from open_webui.utils.chat_fork import build_fork_history
 from open_webui.utils.context_compaction import compact_chat_branch, get_chat_context_usage
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -285,6 +287,81 @@ async def get_session_user_chat_list(
     except Exception as e:
         log.exception(e)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT())
+
+
+@router.get('/manage', response_model=ManagedChatListResponse)
+async def get_managed_chats(
+    query: str = Query(default='', max_length=500),
+    archived: bool | None = None,
+    folder_id: str | None = None,
+    page: int = Query(default=1, ge=1),
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    return await Chats.get_managed_chat_list(
+        user.id, query=query, archived=archived, folder_id=folder_id,
+        skip=(page - 1) * 50, limit=50, db=db,
+    )
+
+
+class BulkChatForm(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=50)
+    action: Literal['move', 'archive', 'unarchive', 'delete']
+    folder_id: str | None = None
+
+
+class BulkChatResult(BaseModel):
+    id: str
+    success: bool
+    error: str | None = None
+
+
+@router.post('/bulk', response_model=list[BulkChatResult])
+async def bulk_manage_chats(
+    request: Request,
+    form_data: BulkChatForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    if form_data.action == 'delete' and user.role != 'admin':
+        if not await has_permission(user.id, 'chat.delete', await Config.get('user.permissions'), db=db):
+            raise HTTPException(status_code=403, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+    if form_data.action == 'move':
+        from open_webui.routers.folders import check_folders_permission
+        await check_folders_permission(request, user, db=db)
+        if form_data.folder_id is not None and not await has_folder_write_access(
+            user.id, form_data.folder_id, db=db
+        ):
+            raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    results = []
+    for chat_id in dict.fromkeys(form_data.ids):
+        try:
+            # Even administrators manage only their own chats on this page.
+            chat = await Chats.get_chat_by_id_and_user_id(chat_id, user.id, db=db)
+            if not chat or chat.meta.get('internal'):
+                raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
+            if form_data.action == 'delete':
+                result = await delete_chat_by_id(request, chat_id, user=user, db=db)
+            elif form_data.action == 'move':
+                result = await update_chat_folder_id_by_id(
+                    request, chat_id, ChatFolderIdForm(folder_id=form_data.folder_id), user=user, db=db
+                )
+            elif chat.archived != (form_data.action == 'archive'):
+                result = await archive_chat_by_id(request, chat_id, user=user, db=db)
+            else:
+                result = True
+            if not result:
+                raise HTTPException(status_code=400, detail=ERROR_MESSAGES.DEFAULT())
+            results.append(BulkChatResult(id=chat_id, success=True))
+        except HTTPException as exc:
+            await db.rollback()
+            results.append(BulkChatResult(id=chat_id, success=False, error=str(exc.detail)))
+        except Exception:
+            await db.rollback()
+            log.exception('Bulk chat operation failed for %s', chat_id)
+            results.append(BulkChatResult(id=chat_id, success=False, error=ERROR_MESSAGES.DEFAULT()))
+    return results
 
 
 @router.post('/read')

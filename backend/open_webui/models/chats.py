@@ -316,6 +316,16 @@ class ChatTitleIdResponse(BaseModel):
     archived: bool = False
 
 
+class ManagedChatResponse(ChatTitleIdResponse):
+    folder_id: str | None = None
+    pinned: bool = False
+
+
+class ManagedChatListResponse(BaseModel):
+    items: list[ManagedChatResponse]
+    total: int
+
+
 class SharedChatResponse(BaseModel):
     id: str
     title: str
@@ -1566,6 +1576,46 @@ class ChatTable:
                 )
                 for chat in all_chats
             ]
+
+    async def get_managed_chat_list(
+        self,
+        user_id: str,
+        query: str = '',
+        archived: bool | None = None,
+        folder_id: str | None = None,
+        skip: int = 0,
+        limit: int = 50,
+        db: AsyncSession | None = None,
+    ) -> ManagedChatListResponse:
+        # Select metadata only: managing history must not load message bodies.
+        conditions = [
+            Chat.user_id == user_id,
+            Chat.meta['internal'].as_boolean().is_not(True),
+        ]
+        if query.strip():
+            conditions.append(Chat.title.icontains(query.strip(), autoescape=True))
+        if archived is not None:
+            conditions.append(Chat.archived == archived)
+        if folder_id is not None:
+            conditions.append(Chat.folder_id == (folder_id or None))
+        async with get_async_db_context(db) as session:
+            total = await session.scalar(select(func.count(Chat.id)).where(*conditions))
+            rows = await session.execute(
+                select(
+                    Chat.id, Chat.title, Chat.updated_at, Chat.created_at,
+                    Chat.archived, Chat.folder_id, Chat.pinned,
+                )
+                .where(*conditions)
+                .order_by(Chat.updated_at.desc(), Chat.id)
+                .offset(skip).limit(limit)
+            )
+            return ManagedChatListResponse(
+                items=[
+                    ManagedChatResponse(**{**dict(row), 'pinned': bool(row['pinned'])})
+                    for row in rows.mappings()
+                ],
+                total=total or 0,
+            )
 
     async def get_chat_title_id_list_by_user_id(
         self,

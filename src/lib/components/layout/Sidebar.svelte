@@ -84,6 +84,7 @@
 	import EditPencilIcon from './Sidebar/icons/EditPencil.svelte';
 	import NotesIcon from './Sidebar/icons/Notes.svelte';
 	import SearchIcon from './Sidebar/icons/Search.svelte';
+	import ChatCheckIcon from '$lib/components/icons/ChatCheck.svelte';
 	import Sidebar from '../icons/Sidebar.svelte';
 	import WorkspaceIcon from './Sidebar/icons/Workspace.svelte';
 	import HotkeyHint from '../common/HotkeyHint.svelte';
@@ -1026,6 +1027,15 @@
 						</Tooltip>
 					</div>
 
+					<Tooltip content={$i18n.t('Manage Chats')} placement="right">
+						<a
+							href="/chats"
+							aria-label={$i18n.t('Manage Chats')}
+							class="flex size-8 items-center justify-center rounded-lg hover:bg-gray-100 dark:hover:bg-gray-900"
+						>
+							<ChatCheckIcon className="size-4" />
+						</a>
+					</Tooltip>
 					{#each pinnedItems as itemId (itemId)}
 						{@const meta = getMenuItemMeta(itemId)}
 						{#if meta && isMenuItemVisible(itemId)}
@@ -1251,6 +1261,23 @@
 							</button>
 						</div>
 
+						<div class="px-1 flex justify-center text-gray-700 dark:text-gray-300">
+							<a
+								id="sidebar-manage-chats-button"
+								href="/chats"
+								aria-current={$page.url.pathname === '/chats' ? 'page' : undefined}
+								class="grow flex items-center gap-2 rounded-xl px-2 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-900 {$page
+									.url.pathname === '/chats'
+									? 'bg-gray-100 dark:bg-gray-900'
+									: ''}"
+								on:click={() => {
+									if ($mobile) showSidebar.set(false);
+								}}
+							>
+								<ChatCheckIcon className="size-4 shrink-0" />
+								<span class="text-[0.8125rem] leading-5">{$i18n.t('Manage Chats')}</span>
+							</a>
+						</div>
 						<div id="pinned-menu-items-list">
 							{#each pinnedItems as itemId (itemId)}
 								{@const meta = getMenuItemMeta(itemId)}
