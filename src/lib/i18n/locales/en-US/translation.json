@@ -3566,5 +3566,11 @@
 	"chatManager.refreshFailed": "The action completed, but the sidebar could not refresh. Please reload the page.",
 	"chatManager.page": "Page {{page}} of {{pages}} · {{total}} chats",
 	"chatManager.selectionHint": "Select all applies to the current page only. Changing the page or filters clears your selection.",
-	"chatManager.unarchiveWarning": "Unarchiving moves these chats out of their folders. You can move them into a folder afterwards."
+	"chatManager.unarchiveWarning": "Unarchiving moves these chats out of their folders. You can move them into a folder afterwards.",
+	"chatManager.unarchive": "Unarchive",
+	"chatManager.archived": "Archived",
+	"chatManager.folder": "Folder",
+	"chatManager.operationFailed": "Operation failed",
+	"chatManager.previous": "Previous",
+	"chatManager.next": "Next"
 }

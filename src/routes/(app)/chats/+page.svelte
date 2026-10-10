@@ -49,7 +49,7 @@
 			: pendingAction === 'archive'
 				? $i18n.t('Archive')
 				: pendingAction === 'unarchive'
-					? $i18n.t('Unarchive')
+					? $i18n.t('chatManager.unarchive')
 					: $i18n.t('Delete');
 
 	function folderName(id: string | null): string {
@@ -62,7 +62,7 @@
 			parts.unshift(current.name);
 			current = folderList.find((item) => item.id === current?.parent_id);
 		}
-		return parts.join(' / ') || $i18n.t('Folder');
+		return parts.join(' / ') || $i18n.t('chatManager.folder');
 	}
 
 	async function load(keep = new Set<string>()) {
@@ -136,7 +136,7 @@
 			});
 			failures = failed.map((item) => ({
 				title: titles.get(item.id) || item.id,
-				error: item.error || $i18n.t('Something went wrong')
+				error: item.error || $i18n.t('chatManager.operationFailed')
 			}));
 			await load(new Set(failed.map((item) => item.id)));
 			await refreshSidebar(localStorage.token).catch(() =>
@@ -247,15 +247,15 @@
 						class="rounded-xl border border-gray-200 bg-white pl-3 pr-8 py-2 text-sm dark:border-gray-700 dark:bg-gray-900"
 					>
 						<option value="false">{$i18n.t('chatManager.unarchived')}</option>
-						<option value="true">{$i18n.t('Archived')}</option>
+						<option value="true">{$i18n.t('chatManager.archived')}</option>
 						<option value="all">{$i18n.t('All')}</option>
 					</select>
 				</label>
 				{#if canMove}
 					<label class="max-w-full">
-						<span class="mb-1 block text-xs text-gray-500">{$i18n.t('Folder')}</span>
+						<span class="mb-1 block text-xs text-gray-500">{$i18n.t('chatManager.folder')}</span>
 						<select
-							aria-label={$i18n.t('Folder')}
+							aria-label={$i18n.t('chatManager.folder')}
 							bind:value={folder}
 							on:change={() => filterChanged()}
 							disabled={busy || !!folderError}
@@ -310,7 +310,7 @@
 				<button
 					class="action"
 					disabled={busy || loading || !selected.size}
-					on:click={() => confirm('unarchive')}>{$i18n.t('Unarchive')}</button
+					on:click={() => confirm('unarchive')}>{$i18n.t('chatManager.unarchive')}</button
 				>
 				{#if canDelete}<button
 						class="action text-red-600 dark:text-red-400"
@@ -356,7 +356,7 @@
 									/></th
 								>
 								<th class="p-3">{$i18n.t('Title')}</th><th class="hidden p-3 sm:table-cell"
-									>{$i18n.t('Folder')}</th
+									>{$i18n.t('chatManager.folder')}</th
 								><th class="hidden whitespace-nowrap p-3 md:table-cell">{$i18n.t('Updated at')}</th>
 							</tr>
 						</thead>
@@ -383,7 +383,7 @@
 											>{item.title || $i18n.t('New Chat')}</a
 										>
 										<div class="mt-1 flex flex-wrap gap-2 text-xs text-gray-500">
-											{#if item.archived}<span>{$i18n.t('Archived')}</span>{/if}
+											{#if item.archived}<span>{$i18n.t('chatManager.archived')}</span>{/if}
 											{#if item.pinned}<span>{$i18n.t('Pinned')}</span>{/if}
 											<span class="sm:hidden">{folderName(item.folder_id)}</span>
 										</div>
@@ -413,7 +413,7 @@
 						on:click={() => {
 							page--;
 							load();
-						}}>{$i18n.t('Previous')}</button
+						}}>{$i18n.t('chatManager.previous')}</button
 					>
 					<button
 						class="action"
@@ -421,7 +421,7 @@
 						on:click={() => {
 							page++;
 							load();
-						}}>{$i18n.t('Next')}</button
+						}}>{$i18n.t('chatManager.next')}</button
 					>
 				</div>
 			</div>

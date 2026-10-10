@@ -3563,5 +3563,11 @@
 	"chatManager.refreshFailed": "操作已完成，但侧栏刷新失败，请重新加载页面。",
 	"chatManager.page": "第 {{page}} / {{pages}} 页 · 共 {{total}} 个对话",
 	"chatManager.selectionHint": "全选仅选择当前页；切换页码或筛选条件会清空选择。",
-	"chatManager.unarchiveWarning": "取消归档会将这些对话移出原文件夹，之后可重新移动到文件夹。"
+	"chatManager.unarchiveWarning": "取消归档会将这些对话移出原文件夹，之后可重新移动到文件夹。",
+	"chatManager.unarchive": "取消归档",
+	"chatManager.archived": "已归档",
+	"chatManager.folder": "文件夹",
+	"chatManager.operationFailed": "操作失败",
+	"chatManager.previous": "上一页",
+	"chatManager.next": "下一页"
 }
