@@ -14,6 +14,7 @@
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import SidebarIcon from '$lib/components/icons/Sidebar.svelte';
+	import ArrowRight from '$lib/components/icons/ArrowRight.svelte';
 
 	const i18n: any = getContext('i18n');
 	let items: ManagedChat[] = [];
@@ -103,10 +104,22 @@
 	}
 
 	function toggle(id: string) {
+		if (busy || loading) return;
 		const next = new Set(selected);
 		if (next.has(id)) next.delete(id);
 		else next.add(id);
 		selected = next;
+	}
+
+	function selectRow(event: MouseEvent, id: string) {
+		if (event.target instanceof Element && event.target.closest('a, button, input')) return;
+		toggle(id);
+	}
+
+	function selectRowWithKeyboard(event: KeyboardEvent, id: string) {
+		if (event.target !== event.currentTarget || !['Enter', ' '].includes(event.key)) return;
+		event.preventDefault();
+		toggle(id);
 	}
 
 	function confirm(action: BulkAction) {
@@ -358,12 +371,21 @@
 								<th class="p-3">{$i18n.t('Title')}</th><th class="hidden p-3 sm:table-cell"
 									>{$i18n.t('chatManager.folder')}</th
 								><th class="hidden whitespace-nowrap p-3 md:table-cell">{$i18n.t('Updated at')}</th>
+								<th class="w-12 p-2"><span class="sr-only">{$i18n.t('Open')}</span></th>
 							</tr>
 						</thead>
 						<tbody>
 							{#each items as item (item.id)}
 								<tr
-									class="border-t border-gray-100 dark:border-gray-800 {selected.has(item.id)
+									tabindex={busy ? -1 : 0}
+									aria-selected={selected.has(item.id)}
+									on:click={(event) => selectRow(event, item.id)}
+									on:keydown={(event) => selectRowWithKeyboard(event, item.id)}
+									class="border-t border-gray-100 dark:border-gray-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 {busy
+										? ''
+										: 'cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-900'} {selected.has(
+										item.id
+									)
 										? 'bg-blue-50/60 dark:bg-blue-950/20'
 										: ''}"
 								>
@@ -377,10 +399,8 @@
 										/></td
 									>
 									<td class="max-w-xs p-3">
-										<a
-											href="/c/{item.id}"
-											class="line-clamp-2 break-words font-medium hover:underline"
-											>{item.title || $i18n.t('New Chat')}</a
+										<span class="line-clamp-2 break-words font-medium"
+											>{item.title || $i18n.t('New Chat')}</span
 										>
 										<div class="mt-1 flex flex-wrap gap-2 text-xs text-gray-500">
 											{#if item.archived}<span>{$i18n.t('chatManager.archived')}</span>{/if}
@@ -394,9 +414,19 @@
 									<td class="hidden whitespace-nowrap p-3 text-gray-500 md:table-cell"
 										>{new Date(item.updated_at * 1000).toLocaleString($i18n.language)}</td
 									>
+									<td class="w-12 p-2">
+										<a
+											href="/c/{item.id}"
+											aria-label={$i18n.t('Open') + ': ' + item.title}
+											title={$i18n.t('Open')}
+											class="flex size-8 items-center justify-center rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800"
+										>
+											<ArrowRight />
+										</a>
+									</td>
 								</tr>
 							{:else}<tr
-									><td colspan="4" class="p-12 text-center text-gray-500"
+									><td colspan="5" class="p-12 text-center text-gray-500"
 										>{$i18n.t('No results found')}</td
 									></tr
 								>{/each}

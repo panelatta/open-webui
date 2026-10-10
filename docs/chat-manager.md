@@ -5,10 +5,13 @@ The page manages only the signed-in user's conversations, including pinned and
 archived chats. Internal agent chats are excluded.
 
 - Search by title, filter by archive status or folder, and browse 50 rows per page.
-- Select individual rows or the current page. Changing filters or pages clears selection.
+- Click anywhere on a row (including its title) to select or deselect it, or use its
+  checkbox. Enter/Space also toggles a focused row. The arrow at the end opens the chat
+  without selecting it. Changing filters or pages clears selection.
 - Move selected chats into a folder or out of folders, archive, unarchive, or delete.
 - Each operation confirms the selected count. Delete is irreversible and stops active
-  generation. Archiving also stops active generation. Both archive transitions\n  follow the existing behavior of moving affected chats out of folders.
+  generation. Archiving also stops active generation. Both archive transitions
+  follow the existing behavior of moving affected chats out of folders.
 - Moving follows the existing behavior: it clears pinning, and moving into a folder
   unarchives the chat.
 - Failed items are reported individually and remain selected when visible. Successful
