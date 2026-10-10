@@ -12,7 +12,8 @@ archived chats. Internal agent chats are excluded.
 - Each operation confirms the selected count. Delete is irreversible and stops active
   generation. Archiving also stops active generation. Both archive transitions
   follow the existing behavior of moving affected chats out of folders.
-- Moving follows the existing behavior: it clears pinning, and moving into a folder
+- Moving preserves the original conversation updated time, including moving out
+  of a folder. It otherwise follows the existing behavior: it clears pinning, and moving into a folder
   unarchives the chat.
 - Failed items are reported individually and remain selected when visible. Successful
   items are not retried. A network error prompts a refresh and review because the

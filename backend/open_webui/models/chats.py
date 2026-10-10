@@ -2347,7 +2347,7 @@ class ChatTable:
             async with get_async_db_context(db) as session:
                 chat = await session.get(Chat, id)
                 chat.folder_id = folder_id
-                chat.updated_at = int(time.time())
+                # Organizing a conversation must not change its content recency.
                 chat.last_read_at = int(time.time())
                 chat.pinned = False
                 if folder_id is not None:

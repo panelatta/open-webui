@@ -141,3 +141,46 @@ def test_http_route_order_and_validation(monkeypatch):
     assert client.get('/chats/manage').status_code == 200
     assert client.get('/chats/manage?page=0').status_code == 422
     assert client.post('/chats/bulk', json={'ids': [], 'action': 'delete'}).status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    'original_folder,target_folder,archived,pinned',
+    [
+        (None, 'target', False, False),
+        ('source', 'target', False, True),
+        ('source', None, False, False),
+        ('target', 'target', False, False),
+        (None, 'target', True, True),
+    ],
+)
+async def test_moving_chat_preserves_content_timestamp(
+    monkeypatch, original_folder, target_folder, archived, pinned
+):
+    monkeypatch.setattr('open_webui.internal.db.DATABASE_ENABLE_SESSION_SHARING', True)
+    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
+    async with engine.begin() as conn:
+        await conn.run_sync(Chat.__table__.create)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    content = {'title': 'Historical chat', 'messages': [{'role': 'user', 'content': 'Keep me'}]}
+    async with sessions() as db:
+        row = Chat(
+            id='historical', user_id='owner', title='Historical chat', chat=content,
+            created_at=100, updated_at=200, last_read_at=150, meta={},
+            folder_id=original_folder, archived=archived, pinned=pinned,
+        )
+        db.add(row)
+        await db.commit()
+        result = await Chats.update_chat_folder_id_by_id_and_user_id(
+            'historical', 'owner', target_folder, db=db
+        )
+        assert result is not None
+        assert result.updated_at == 200
+        assert result.created_at == 100
+        assert result.chat == content
+        assert result.folder_id == target_folder
+        assert result.pinned is False
+        assert result.archived is (False if target_folder is not None else archived)
+        await db.refresh(row)
+        assert row.updated_at == 200
+    await engine.dispose()
