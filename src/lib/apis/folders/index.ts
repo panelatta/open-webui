@@ -323,6 +323,7 @@ export const getSharedFolderChats = async (
 	folderId: string,
 	params: {
 		page?: number | null;
+		pageSize?: number;
 		sortBy?: 'title' | 'updated_at';
 		sortDir?: 'asc' | 'desc';
 	} = {}
@@ -332,6 +333,9 @@ export const getSharedFolderChats = async (
 	const searchParams = new URLSearchParams();
 	if (params.page !== undefined && params.page !== null) {
 		searchParams.append('page', `${params.page}`);
+	}
+	if (params.pageSize !== undefined) {
+		searchParams.append('page_size', `${params.pageSize}`);
 	}
 	if (params.sortBy) {
 		searchParams.append('sort_by', params.sortBy);

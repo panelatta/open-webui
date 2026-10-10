@@ -113,7 +113,11 @@
 		!$selectedFolder.write_access;
 </script>
 
-<div class="m-auto w-full max-w-[58rem] px-1 @2xl:px-20 translate-y-6 py-24 text-center">
+<div
+	class="w-full text-center {$selectedFolder
+		? 'mx-auto mb-auto max-w-6xl px-2 @md:px-6 pt-14 pb-6'
+		: 'm-auto max-w-[58rem] px-1 @2xl:px-20 translate-y-6 py-24'}"
+>
 	{#if $temporaryChatEnabled}
 		<Tooltip
 			content={$i18n.t("This chat won't appear in history and your messages will not be saved.")}
@@ -239,7 +243,11 @@
 				</div>
 			{/if}
 
-			<div class="text-base font-normal @md:max-w-3xl w-full py-3 {atSelectedModel ? 'mt-2' : ''}">
+			<div
+				class="text-base font-normal w-full {$selectedFolder
+					? 'py-2'
+					: '@md:max-w-3xl py-3'} {atSelectedModel ? 'mt-2' : ''}"
+			>
 				{#if !($selectedFolder && folderReadOnly)}
 					<MessageInput
 						bind:params
@@ -285,7 +293,7 @@
 	</div>
 
 	{#if $selectedFolder}
-		<div class="mx-auto px-4 md:max-w-3xl md:px-6 min-h-62" in:fade={{ duration: 200, delay: 200 }}>
+		<div class="mx-auto w-full px-2 @md:px-4 min-h-62" in:fade={{ duration: 200, delay: 200 }}>
 			<FolderPlaceholder folder={$selectedFolder} />
 		</div>
 	{:else}

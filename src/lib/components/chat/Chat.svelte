@@ -4593,7 +4593,7 @@
 								</div>
 							</div>
 						{:else}
-							<div class="flex items-center h-full">
+							<div class="flex {$selectedFolder ? 'items-start min-h-full' : 'items-center h-full'}">
 								<Placeholder
 									bind:params
 									bind:selectedModelIdx

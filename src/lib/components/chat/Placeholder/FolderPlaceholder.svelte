@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 
 	import { socket, user } from '$lib/stores';
 
@@ -24,8 +24,9 @@
 	export let folder: FolderPlaceholderFolder | null = null;
 
 	let selectedTab = 'chats';
+	let listElement: HTMLDivElement;
 
-	const CHATS_PAGE_SIZE = 10;
+	const CHATS_PAGE_SIZE = 50;
 	let page = 1;
 	let totalChats = 0;
 	let orderBy: 'title' | 'updated_at' = 'updated_at';
@@ -53,13 +54,15 @@
 		setChatList();
 	};
 
-	const setPage = (nextPage: number) => {
+	const setPage = async (nextPage: number) => {
 		if (nextPage === page || chatListLoading) {
 			return;
 		}
 
 		page = nextPage;
-		setChatList();
+		await setChatList();
+		await tick();
+		listElement?.scrollIntoView({ block: 'start' });
 	};
 
 	const updateChatActive = (chatId: string, active: boolean) => {
@@ -107,6 +110,7 @@
 			chatListLoading = true;
 			const res = await getSharedFolderChats(localStorage.token, folderId, {
 				page,
+				pageSize: CHATS_PAGE_SIZE,
 				sortBy: orderBy,
 				sortDir: direction
 			}).catch((error) => {
@@ -167,7 +171,7 @@
 	}
 </script>
 
-<div>
+<div bind:this={listElement}>
 	<!-- <div class="mb-1">
 		<div
 			class="flex gap-1 scrollbar-none overflow-x-auto w-fit text-center text-sm font-normal rounded-full bg-transparent py-1 touch-auto pointer-events-auto"

@@ -564,6 +564,7 @@ async def get_shared_folder_chats(
     request: Request,
     id: str,
     page: int | None = Query(None, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     sort_by: str = Query('unread_updated_at'),
     sort_dir: str = Query('desc'),
     user=Depends(get_verified_user),
@@ -589,7 +590,7 @@ async def get_shared_folder_chats(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    limit = 10
+    limit = page_size
     skip = (page - 1) * limit if page is not None else 0
     chats = await Chats.get_all_chats_by_folder_id(
         id,
