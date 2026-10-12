@@ -3928,5 +3928,6 @@
 	"chatManager.folder": "Folder",
 	"chatManager.operationFailed": "Operation failed",
 	"chatManager.previous": "Previous",
-	"chatManager.next": "Next"
+	"chatManager.next": "Next",
+	"Password signup does not verify email ownership. Confirm this person through a trusted channel before approving.": "Password signup does not verify email ownership. Confirm this person through a trusted channel before approving."
 }

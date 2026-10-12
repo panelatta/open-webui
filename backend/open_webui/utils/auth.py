@@ -34,6 +34,7 @@ from open_webui.env import (
     pk,
 )
 from open_webui.models.auths import Auths
+from open_webui.models.security import SessionRevocations
 from open_webui.models.config import Config
 from open_webui.models.users import Users
 from open_webui.utils.access_control import has_permission
@@ -184,6 +185,8 @@ async def get_password_hash(password: str) -> str:
 
 
 def validate_password(password: str) -> bool:
+    if not password or not password.strip():
+        raise ValueError('Password must not be empty.')
     # bcrypt only accepts 72 bytes; reject long new passwords instead of storing an unusable hash.
     if PASSWORD_HASH_ALGORITHM == 'bcrypt' and len(password.encode('utf-8')) > PASSWORD_BCRYPT_MAX_BYTES:
         raise Exception(
@@ -277,6 +280,9 @@ async def is_valid_token(decoded, redis=None) -> bool:
     from open_webui.utils.mfa import get_auth, get_mfa_config, is_mfa_required
 
     auth = await get_auth(decoded.get('id', ''))
+    jti = decoded.get('jti')
+    if jti is not None and (not isinstance(jti, str) or await SessionRevocations.is_revoked(jti)):
+        return False
     if decoded.get('session_stamp') != auth.session_stamp:
         return False
     token_type = decoded.get('typ', 'session')
@@ -329,31 +335,16 @@ async def invalidate_token(request, token):
     if not decoded:
         return
 
-    # Require Redis to store revoked tokens
-    if request.app.state.redis:
-        jti = decoded.get('jti')
-        exp = decoded.get('exp')
-
-        if jti and exp:
-            ttl = exp - int(datetime.now(UTC).timestamp())  # Calculate time-to-live for the token
-
-            if ttl > 0:
-                # Revoked tokens must not be able to disconnect newer sessions.
-                if not await is_valid_token(decoded, request.app.state.redis):
-                    return
-
-                # Store the revoked token in Redis with an expiration time
-                await request.app.state.redis.set(
-                    f'{REDIS_KEY_PREFIX}:auth:token:{jti}:revoked',
-                    '1',
-                    ex=ttl,
-                )
-
-                user_id = decoded.get('id')
-                if user_id:
-                    from open_webui.socket.main import disconnect_user_sessions
-
-                    await disconnect_user_sessions(user_id)
+    # The database is authoritative even without Redis, after restarts, and across workers.
+    if not await is_valid_token(decoded, getattr(request.app.state, 'redis', None)):
+        return
+    jti = decoded.get('jti')
+    if not jti:
+        await revoke_user_tokens(request, decoded['id'])  # Legacy sessions lack a per-session ID.
+        return
+    await SessionRevocations.revoke(jti, decoded.get('exp'))
+    from open_webui.socket.main import disconnect_user_sessions
+    await disconnect_user_sessions(decoded['id'])
 
 
 async def revoke_user_tokens(request, user_id: str):

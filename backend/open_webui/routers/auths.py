@@ -93,6 +93,8 @@ log = logging.getLogger(__name__)
 # Forgive us our failed attempts, as we forgive those
 # who exceed their allotted rate against this gate.
 signin_rate_limiter = RateLimiter(limit=5 * 3, window=60 * 3)
+signup_ip_limiter = RateLimiter(limit=5, window=3600)
+signup_global_limiter = RateLimiter(limit=20, window=3600)
 # Best-effort throttle only: there is no caller identity before the provider answers,
 # and deployments may derive request.client from proxy headers.
 token_exchange_rate_limiter = (
@@ -847,6 +849,11 @@ async def signup(
     form_data: SignupForm,
     db: AsyncSession = Depends(get_async_session),
 ):
+    redis = getattr(request.app.state, 'redis', None)
+    client = request.client.host if request.client else 'unknown'
+    if (await signup_ip_limiter.is_limited(redis, 'signup:ip:' + client)
+            or await signup_global_limiter.is_limited(redis, 'signup:global')):
+        raise HTTPException(429, 'Too many signup attempts. Try again later.', headers={'Retry-After': '3600'})
     has_users = await Users.has_users(db=db)
 
     if WEBUI_AUTH:
@@ -1121,6 +1128,8 @@ async def add_user(
 async def get_admin_details(
     request: Request, user=Depends(get_current_user), db: AsyncSession = Depends(get_async_session)
 ):
+    if user.role == 'pending':
+        raise HTTPException(403, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
     if await Config.get('auth.admin.show'):
         admin_email = await Config.get('auth.admin.email')
         admin_name = None

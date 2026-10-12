@@ -3221,14 +3221,8 @@ async def serve_cache_file(
     everything else gets a ``Content-Disposition: attachment`` header to prevent
     XSS from user-generated HTML stored in the cache directory.
     """
-    file_path = os.path.abspath(os.path.join(CACHE_DIR, path))
-    # trailing os.sep is required: without it, a path resolving to a sibling
-    # whose name starts with the cache-dir basename (e.g. cache_backup) passes
-    cache_root = os.path.abspath(CACHE_DIR) + os.sep
-    if not file_path.startswith(cache_root):
-        raise HTTPException(status_code=404, detail='File not found')
-    if not os.path.isfile(file_path):
-        raise HTTPException(status_code=404, detail='File not found')
+    from open_webui.utils.artifact_access import require_cache_read
+    file_path = await require_cache_read(path, user)
 
     mime, _ = mimetypes.guess_type(file_path)
     inline_safe = mime and mime.split('/', 1)[0] in {'image', 'audio', 'video'}

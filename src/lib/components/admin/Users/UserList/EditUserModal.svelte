@@ -201,6 +201,14 @@
 										</div>
 									</div>
 
+									{#if !_user?.oauth || Object.keys(_user.oauth).length === 0}
+										<p class="text-xs text-amber-700 dark:text-amber-300">
+											{$i18n.t(
+												'Password signup does not verify email ownership. Confirm this person through a trusted channel before approving.'
+											)}
+										</p>
+									{/if}
+
 									{#if _user?.oauth}
 										<div class="flex flex-col w-full">
 											<div class=" mb-1 text-xs text-gray-500">{$i18n.t('OAuth ID')}</div>

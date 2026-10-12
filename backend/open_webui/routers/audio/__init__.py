@@ -55,6 +55,7 @@ from open_webui.events import EVENTS, publish_event
 from open_webui.models.config import Config
 from open_webui.routers.audio import realtime
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.artifact_access import register_cache_file
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.json_codec import JSONCodec
@@ -813,12 +814,14 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             + (b':slim' if USE_SLIM else b'')
         ).hexdigest()
 
+    name = hashlib.sha256((user.id + ':' + name).encode()).hexdigest()
     extension = 'wav' if engine == 'openai-realtime' else 'mp3'
     file_path = SPEECH_CACHE_DIR.joinpath(f'{name}.{extension}')
     file_body_path = SPEECH_CACHE_DIR.joinpath(f'{name}.json')
 
     # Return cached result if available
     if file_path.is_file():
+        await register_cache_file(file_path, user)
         await publish_event(
             request,
             EVENTS.AUDIO_SPEECH_REQUESTED,
@@ -844,6 +847,9 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         raise HTTPException(status_code=400, detail=f'Unsupported TTS engine: {engine}')
 
     response = await handler(request, payload, file_path, file_body_path, user)
+    for cache_path in (file_path, file_body_path):
+        if cache_path.is_file():
+            await register_cache_file(cache_path, user)
     await publish_event(
         request,
         EVENTS.AUDIO_SPEECH_REQUESTED,
@@ -1494,6 +1500,7 @@ async def transcription(
 
         async with aiofiles.open(file_path, 'wb') as f:
             await f.write(contents)
+        await register_cache_file(file_path, user)
 
         try:
             metadata = None

@@ -3924,5 +3924,6 @@
 	"chatManager.folder": "文件夹",
 	"chatManager.operationFailed": "操作失败",
 	"chatManager.previous": "上一页",
-	"chatManager.next": "下一页"
+	"chatManager.next": "下一页",
+	"Password signup does not verify email ownership. Confirm this person through a trusted channel before approving.": "密码注册不会验证邮箱归属。批准账号前，请通过可信渠道确认对方身份。"
 }

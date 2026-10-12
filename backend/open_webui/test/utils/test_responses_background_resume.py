@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -303,6 +304,7 @@ def test_background_resume_azure_requires_explicit_route_opt_in(monkeypatch):
 
 @pytest.mark.anyio
 async def test_resolve_openai_route_rejects_missing_model_without_defaulting(monkeypatch):
+    monkeypatch.setattr(openai.Config, 'get', AsyncMock(return_value=True))
     request = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
@@ -329,7 +331,8 @@ async def test_resolve_openai_route_rejects_missing_model_without_defaulting(mon
 
 
 @pytest.mark.anyio
-async def test_resolve_openai_route_uses_stored_route_idx():
+async def test_resolve_openai_route_uses_stored_route_idx(monkeypatch):
+    monkeypatch.setattr(openai.Config, 'get', AsyncMock(return_value=True))
     request = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
@@ -357,7 +360,8 @@ async def test_resolve_openai_route_uses_stored_route_idx():
 
 
 @pytest.mark.anyio
-async def test_resolve_openai_route_rejects_invalid_stored_route_idx():
+async def test_resolve_openai_route_rejects_invalid_stored_route_idx(monkeypatch):
+    monkeypatch.setattr(openai.Config, 'get', AsyncMock(return_value=True))
     request = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(

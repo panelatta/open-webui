@@ -68,6 +68,11 @@ from open_webui.utils.session_pool import (
     get_session,
     stream_wrapper,
 )
+from open_webui.utils.artifact_access import (
+    require_file_read, require_artifact, provider_scope, validate_provider_references,
+    record_provider_response, owned_response_stream, register_cache_file,
+)
+from open_webui.models.security import SecurityArtifacts
 from open_webui.storage.provider import Storage
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -452,9 +457,7 @@ async def ensure_openai_file_id(
     metadata: Optional[dict] = None,
     user: Optional[UserModel] = None,
 ) -> Optional[str]:
-    file_item = await Files.get_file_by_id(file_id)
-    if not file_item:
-        return None
+    file_item = await require_file_read(file_id, user)
 
     url, key, api_config = await get_openai_connection(idx)
     openai_file_id = await asyncio.to_thread(
@@ -470,6 +473,10 @@ async def ensure_openai_file_id(
     )
 
     if openai_file_id:
+        await SecurityArtifacts.record(
+            'file', provider_scope(url, key, api_config), openai_file_id,
+            file_item.user_id, local_file_id=file_item.id,
+        )
         await Files.update_file_data_by_id(
             file_item.id,
             {
@@ -521,6 +528,8 @@ async def inject_openai_files_into_messages(
                 metadata=metadata,
                 user=user,
             )
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(
                 status_code=400,
@@ -951,7 +960,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         idx = api_base_urls.index('https://api.openai.com/v1')
 
         body = await request.body()
-        name = hashlib.sha256(body).hexdigest()
+        name = hashlib.sha256(user.id.encode() + b'\0' + body).hexdigest()
 
         SPEECH_CACHE_DIR = CACHE_DIR / 'audio' / 'speech'
         SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -960,6 +969,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
         # Check if the file already exists in the cache
         if file_path.is_file():
+            await register_cache_file(file_path, user)
             return FileResponse(file_path)
 
         url, key, api_config = await get_openai_connection(idx)
@@ -986,6 +996,8 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             async with aiofiles.open(file_body_path, 'w') as f:
                 await f.write(JSONCodec.dumps(JSONCodec.loads(body.decode('utf-8'))))
 
+            await register_cache_file(file_path, user)
+            await register_cache_file(file_body_path, user)
             # Return the saved file
             return FileResponse(file_path)
 
@@ -2205,6 +2217,8 @@ async def generate_chat_completion(
     requested_model = payload.get("model")
     request_url, payload = build_openai_request(payload)
     status_payload = json.loads(payload)
+    artifact_scope = provider_scope(url, key, api_config)
+    await validate_provider_references(status_payload, artifact_scope, user)
     status_payload.setdefault("model", requested_model)
     generation_status = await start_generation_status(request, metadata, status_payload, model)
 
@@ -2281,8 +2295,13 @@ async def generate_chat_completion(
                 if is_responses:
                     response_headers['x-openwebui-openai-url-idx'] = str(idx)
                     response_headers['x-openwebui-openai-base-url'] = url
+                response_stream = stream_wrapper(r)
+                if is_responses:
+                    response_stream = owned_response_stream(
+                        response_stream, artifact_scope, user, form_data.get('model'), (metadata or {}).get('chat_id')
+                    )
                 return StreamingResponse(
-                    generation_status.wrap(stream_wrapper(r)) if generation_status else stream_wrapper(r),
+                    generation_status.wrap(response_stream) if generation_status else response_stream,
                     status_code=r.status,
                     headers=response_headers,
                 )
@@ -2340,11 +2359,16 @@ async def generate_chat_completion(
             if generation_status:
                 await generation_status.observe(response)
 
-            # Convert Responses API result to simple format
+            # Persist ownership before exposing identifiers to a client or a retry.
             if is_responses and isinstance(response, dict):
+                await record_provider_response(
+                    response, artifact_scope, user, form_data.get('model'), (metadata or {}).get('chat_id')
+                )
                 response = convert_responses_result(response)
 
             return response
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception(e)
 
@@ -2495,6 +2519,8 @@ async def resolve_openai_route(
     user,
     route_idx: int | None = None,
 ):
+    if not await Config.get('openai.enable'):
+        raise HTTPException(503, 'OpenAI API is disabled')
     if route_idx is not None:
         state_config = getattr(getattr(request.app, 'state', None), 'config', None)
         if state_config is not None and hasattr(state_config, 'OPENAI_API_BASE_URLS'):
@@ -2515,6 +2541,8 @@ async def resolve_openai_route(
         url = urls[idx]
         key = keys[idx]
         api_config = api_configs.get(str(idx), api_configs.get(url, {})) if isinstance(api_configs, dict) else {}
+        if api_config.get('enable', True) is False:
+            raise HTTPException(403, 'Provider connection is disabled')
         return idx, url, key, api_config
     else:
         if not model_id:
@@ -2573,6 +2601,7 @@ async def resume_response_stream(
         log.info('Responses background resume is not enabled for model=%s url=%s', model_id, url)
         return None
 
+    await require_artifact('response', response_id, provider_scope(url, key, api_config), user)
     headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
 
     if api_config.get('azure') or api_config.get('provider') == 'azure':
@@ -2671,6 +2700,7 @@ async def get_response(
             detail='Responses background retrieve/resume is not enabled for this provider.',
         )
 
+    await require_artifact('response', response_id, provider_scope(url, key, api_config), user)
     headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
 
     if api_config.get('azure') or api_config.get('provider') == 'azure':
@@ -2769,6 +2799,8 @@ async def responses(
         payload['background'] = True
         payload['store'] = True
 
+    artifact_scope = provider_scope(url, key, api_config)
+    await validate_provider_references(payload, artifact_scope, user)
     payload['model'] = strip_provider_model_prefix(payload['model'], api_config.get('prefix_id'))
     body = JSONCodec.dumps(payload)
 
@@ -2818,7 +2850,9 @@ async def responses(
             response_headers['x-openwebui-openai-url-idx'] = str(idx)
             response_headers['x-openwebui-openai-base-url'] = url
             return StreamingResponse(
-                stream_wrapper(r, passthrough=True),
+                owned_response_stream(
+                    stream_wrapper(r), artifact_scope, user, model_id
+                ),
                 status_code=r.status,
                 headers=response_headers,
             )
@@ -2860,6 +2894,7 @@ async def responses(
                 else:
                     return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
 
+            await record_provider_response(response_data, artifact_scope, user, model_id)
             return response_data
 
     except HTTPException:
