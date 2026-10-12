@@ -78,3 +78,12 @@ uploads with process=false, real hosted file reading/stream completion and
 memory-only embedding. Compare database integrity/counts and vector collections
 before/after. Activate production MFA after smoke tests; enrollment then belongs
 to the human account owner.
+
+The deployment environment/Compose changes are reproducible with
+scripts/configure-local-security.py. Pass the existing deployment directory,
+public HTTPS origin, Git build hash, published port and actual Docker proxy
+gateway. Back up .env and docker-compose.yml first. The script retains other
+settings and secrets, adds only the security settings, and keeps explicit
+localhost origins for local access. Copy existing package static assets to the
+data/static directory before starting with the read-only backend mount.
+Run harden-local-security.py in the container with PYTHONPATH=/app/backend.
