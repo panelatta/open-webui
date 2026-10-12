@@ -14,7 +14,6 @@ import aiofiles
 import aiohttp
 from aiocache import cached
 import requests
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import (
     FileResponse,
@@ -52,7 +51,7 @@ from open_webui.utils.access_control import check_model_access, has_connection_a
 from open_webui.utils.anthropic import ANTHROPIC_VERSION, get_anthropic_models, is_anthropic_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.embedding_policy import EMBEDDING_DISABLED_MESSAGE
-from open_webui.utils.headers import get_custom_headers, include_user_info_headers
+from open_webui.utils.headers import get_headers_and_cookies, get_microsoft_entra_id_access_token, include_user_info_headers
 from open_webui.utils.generation_status import start_generation_status
 from open_webui.utils.reasoning_capabilities import supplement_reasoning_capabilities
 from open_webui.utils.reasoning_levels import model_chain, default_config, apply_reasoning_level, apply_client_reasoning_effort
@@ -237,87 +236,6 @@ def summarize_response_debug_value(value):
             for key, item in value.items()
         }
     return value
-
-
-async def get_headers_and_cookies(
-    request: Request,
-    url,
-    key=None,
-    config=None,
-    metadata: dict | None = None,
-    user: UserModel = None,
-):
-    cookies = getattr(request, 'cookies', {}) if config.get('forward_cookies', False) else {}
-    headers = {
-        'Content-Type': 'application/json',
-        **(
-            {
-                # LICENSE covers this Open WebUI upstream metadata identifier.
-                # Do not alter, remove, obscure, or replace it except as LICENSE permits:
-                # https://docs.openwebui.com/license.
-                'HTTP-Referer': 'https://openwebui.com/',
-                'X-Title': 'Open WebUI',
-            }
-            if 'openrouter.ai' in url
-            else {}
-        ),
-    }
-
-    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-        headers = include_user_info_headers(headers, user, request=request)
-        if metadata and metadata.get('chat_id'):
-            headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get('chat_id')
-
-    token = None
-    auth_type = config.get('auth_type')
-
-    if auth_type == 'bearer' or auth_type is None:
-        # Default to bearer if not specified
-        token = f'{key}'
-    elif auth_type == 'none':
-        token = None
-    elif auth_type == 'session':
-        token = request.state.token.credentials
-    elif auth_type == 'system_oauth':
-        oauth_token = None
-        try:
-            if request.cookies.get('oauth_session_id', None):
-                oauth_token = await request.app.state.oauth_manager.get_oauth_token(
-                    user.id,
-                    request.cookies.get('oauth_session_id', None),
-                )
-        except Exception as e:
-            log.error(f'Error getting OAuth token: {e}')
-
-        if oauth_token:
-            token = f'{oauth_token.get("access_token", "")}'
-
-    elif auth_type in ('azure_ad', 'microsoft_entra_id'):
-        token = get_microsoft_entra_id_access_token()
-
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-
-    if config.get('headers') and isinstance(config.get('headers'), dict):
-        custom_headers = await get_custom_headers(config.get('headers'), user, metadata, request=request)
-        headers.update(custom_headers)
-
-    return headers, cookies
-
-
-def get_microsoft_entra_id_access_token():
-    """
-    Get Microsoft Entra ID access token using DefaultAzureCredential for Azure OpenAI.
-    Returns the token string or None if authentication fails.
-    """
-    try:
-        token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(), 'https://cognitiveservices.azure.com/.default'
-        )
-        return token_provider()
-    except Exception as e:
-        log.error(f'Error getting Microsoft Entra ID access token: {e}')
-        return None
 
 
 def build_openai_file_upload_headers(
@@ -765,7 +683,7 @@ async def get_openai_connection(idx: int) -> tuple[str, str, dict]:
     return url, key, api_config
 
 
-async def clear_openai_model_cache(request: Request):
+async def clear_models_cache(request: Request):
     await get_all_models.cache.clear()
     redis = getattr(request.app.state, 'redis', None)
     if redis is not None:
@@ -996,7 +914,7 @@ async def update_config(request: Request, form_data: OpenAIConfigForm, user=Depe
         }
     )
 
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
 
     await publish_event(
         request,
@@ -1188,7 +1106,9 @@ async def get_filtered_models(models, user, db=None):
     # Filter models based on user access control
     model_ids = [model['id'] for model in models.get('data', [])]
     model_infos = {model_info.id: model_info for model_info in await Models.get_models_by_ids(model_ids, db=db)}
-    user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id, db=db)}
+    user_group_ids = {
+        group.id for group in await Groups.get_groups_by_member_id(user.id, db=db, include_inherited=True)
+    }
 
     # Batch-fetch accessible resource IDs in a single query instead of N has_access calls
     accessible_model_ids = await AccessGrants.get_accessible_resource_ids(
@@ -1385,7 +1305,7 @@ async def download_provider_model(
     payload['model'] = strip_provider_model_prefix(payload['model'], api_config.get('prefix_id'))
 
     result = await send_model_management_request(request, url_idx, 'download', 'POST', payload, user=user)
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
     await publish_event(
         request,
         EVENTS.MODEL_PROVIDER_MODEL_CREATED,
@@ -1424,7 +1344,7 @@ async def load_provider_model(
     payload['model'] = strip_provider_model_prefix(payload['model'], api_config.get('prefix_id'))
 
     result = await send_model_management_request(request, url_idx, 'load', 'POST', payload, user=user)
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
     return result
 
 
@@ -1440,7 +1360,7 @@ async def unload_provider_model(
     payload['model'] = strip_provider_model_prefix(payload['model'], api_config.get('prefix_id'))
 
     result = await send_model_management_request(request, url_idx, 'unload', 'POST', payload, user=user)
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
     return result
 
 
@@ -1467,7 +1387,7 @@ async def delete_provider_model(
         query={'model': actual_model},
         user=user,
     )
-    await clear_openai_model_cache(request)
+    await clear_models_cache(request)
     await publish_event(
         request,
         EVENTS.MODEL_PROVIDER_MODEL_DELETED,
@@ -1614,7 +1534,8 @@ def get_azure_allowed_params(api_version: str) -> set[str]:
 
 
 def is_openai_new_model(model: str) -> bool:
-    model_lower = model.lower()
+    # Amazon Bedrock ids carry a provider prefix, e.g. us.openai.gpt-6-sol
+    model_lower = re.sub(r'^(?:[a-z-]+\.)?openai\.', '', model.lower())
     # o-series models (o1, o3, o4, o5, ...)
     if re.match(r'^o\d+', model_lower):
         return True
@@ -2313,6 +2234,7 @@ async def generate_chat_completion(
                 # read the body and return a proper error response instead of
                 # streaming the error back (which hides the error from logs).
                 if r.status >= 400:
+                    retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ("retry-after", "retry-after-ms")}
                     error_body = await r.text()
                     log.error(
                         "Provider returned HTTP %d with SSE content-type: %s",
@@ -2331,7 +2253,7 @@ async def generate_chat_completion(
                             requested_model=requested_model,
                             upstream_error=error_json,
                         )
-                        return JSONResponse(status_code=r.status, content=error_json)
+                        return JSONResponse(status_code=r.status, content=error_json, headers=retry_headers)
                     except json.JSONDecodeError:
                         await publish_model_provider_request_failed(
                             request,
@@ -2351,6 +2273,7 @@ async def generate_chat_completion(
                                     "code": r.status,
                                 }
                             },
+                            headers=retry_headers,
                         )
 
                 streaming = True
@@ -2398,6 +2321,7 @@ async def generate_chat_completion(
                 continue
 
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,
@@ -2409,9 +2333,9 @@ async def generate_chat_completion(
                     upstream_error=response,
                 )
                 if isinstance(response, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response)
+                    return JSONResponse(status_code=r.status, content=response, headers=retry_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response)
+                    return PlainTextResponse(status_code=r.status, content=response, headers=retry_headers)
 
             if generation_status:
                 await generation_status.observe(response)
@@ -2516,6 +2440,7 @@ async def embeddings(request: Request, form_data: dict, user):
                 response_data = await r.text()
 
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,
@@ -2527,9 +2452,9 @@ async def embeddings(request: Request, form_data: dict, user):
                     upstream_error=response_data,
                 )
                 if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data)
+                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data)
+                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
 
             return response_data
     except Exception as e:
@@ -2919,6 +2844,7 @@ async def responses(
                         default=str,
                     ),
                 )
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,
@@ -2930,9 +2856,9 @@ async def responses(
                     upstream_error=response_data,
                 )
                 if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data)
+                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data)
+                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
 
             return response_data
 
@@ -3041,6 +2967,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
                 response_data = await r.text()
 
             if r.status >= 400:
+                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,
@@ -3052,9 +2979,9 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
                     upstream_error=response_data,
                 )
                 if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data)
+                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data)
+                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
 
             return response_data
 

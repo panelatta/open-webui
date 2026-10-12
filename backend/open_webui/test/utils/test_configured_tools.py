@@ -43,17 +43,16 @@ async def test_configured_search_coexists_with_builtins_but_explicit_tools_opt_o
 
     builtin = AsyncMock(return_value={'create_tasks': {'spec': {'name': 'create_tasks'}}})
     monkeypatch.setattr(middleware.Config, 'get', config_get)
-    monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', False)
     monkeypatch.setattr(middleware, 'convert_url_images_to_base64', identity)
     monkeypatch.setattr(middleware, 'get_event_emitter', AsyncMock(return_value=None))
     monkeypatch.setattr(middleware, 'get_event_call', AsyncMock(return_value=None))
     monkeypatch.setattr(middleware, 'get_system_oauth_token', AsyncMock(return_value=None))
     monkeypatch.setattr(middleware, 'get_task_model_id', lambda *args: model['id'])
     monkeypatch.setattr(middleware, 'process_pipeline_inlet_filter', pipeline)
-    monkeypatch.setattr(middleware, 'add_file_context', identity)
     monkeypatch.setattr(middleware, 'get_builtin_tools', builtin)
 
-    body, _, _ = await middleware.process_chat_payload(request, form_data, user, metadata, model)
+    body, _, _, paused = await middleware.process_chat_payload(request, form_data, user, metadata, model)
+    assert paused is False
 
     if caller_tools is not None:
         assert body['tools'] == caller_tools

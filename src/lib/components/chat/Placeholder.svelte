@@ -40,6 +40,7 @@
 	export let stopResponse: Function;
 
 	export let autoScroll = false;
+	export let callActive = false;
 
 	export let atSelectedModel: Model | undefined;
 	export let selectedModels: [''];
@@ -251,6 +252,8 @@
 				{#if !($selectedFolder && folderReadOnly)}
 					<MessageInput
 						bind:params
+
+						{callActive}
 						bind:this={messageInput}
 						{history}
 						bind:selectedModels
