@@ -2,7 +2,7 @@
 
 This merge retains the fork history through `61f932f72` and merges the official
 v0.12.0 release. Deployment must build the frontend locally with Node 22,
-`BUILD_MAX_OLD_SPACE_MB=4096 npm run build:safe`, and 8 GiB swap.
+`BUILD_MAX_OLD_SPACE_MB=6144 npm run build:safe`, 8 GiB VM RAM, and 8 GiB swap.
 
 ## Compatibility adaptations
 

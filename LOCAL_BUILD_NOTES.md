@@ -28,3 +28,6 @@ host, use Node 22, the existing 8 GB swap, and `BUILD_MAX_OLD_SPACE_MB=4096`.
 
 Do not selectively patch compiled frontend files in runtime deployment.
 Frontend changes must come from source and be deployed as one coherent build.
+
+For v0.12.0, the 4096 MiB heap exhausted during chunk rendering. Use
+8 GiB VM RAM, 8 GiB swap, Node 22, and `BUILD_MAX_OLD_SPACE_MB=6144`.
