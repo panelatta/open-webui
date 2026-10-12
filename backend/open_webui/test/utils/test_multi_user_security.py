@@ -119,6 +119,16 @@ async def test_unapproved_file_access(role):
     "payload",
     [
         {"previous_response_id": "resp-a"},
+        {"tools": [{"type": "code_interpreter", "container": "container-a"}]},
+        {
+            "tools": [
+                {
+                    "type": "code_interpreter",
+                    "container": {"type": "auto", "file_ids": ["file-a"]},
+                }
+            ]
+        },
+        {"tools": [{"type": "file_search", "vector_store_ids": ["store-a"]}]},
         {"conversation": "conv-a"},
         {"conversation": {"id": "conv-a"}},
         {"input": [{"type": "item_reference", "id": "item-a"}]},
@@ -270,3 +280,17 @@ def test_empty_password_rejected_even_if_complexity_disabled(monkeypatch, passwo
     monkeypatch.setattr(auth, "ENABLE_PASSWORD_VALIDATION", False)
     with pytest.raises(ValueError):
         auth.validate_password(password)
+
+
+@pytest.mark.anyio
+async def test_native_container_owner_isolation(registry):
+    await artifact_access.record_provider_response(
+        {"id": "resp-code", "object": "response", "output": [
+            {"id": "item-code", "type": "code_interpreter_call", "container_id": "container-a"}
+        ]},
+        "scope", OWNER, "model",
+    )
+    payload = {"tools": [{"type": "code_interpreter", "container": "container-a"}]}
+    await artifact_access.validate_provider_references(payload, "scope", OWNER)
+    with pytest.raises(HTTPException):
+        await artifact_access.validate_provider_references(payload, "scope", OTHER)

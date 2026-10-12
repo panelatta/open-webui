@@ -8,10 +8,12 @@ hosted attachments, Responses identifiers and cached media.
 - Hosted uploads check the authenticated user's file ownership or current read
   grants before opening, uploading, reusing or updating the file. Both normal
   chat completions and the direct OpenAI-compatible endpoint use this check.
-- Provider response, item, conversation and file IDs have a durable ownership
+- Provider response, item, conversation, container and file IDs have a durable ownership
   registry. The registry is scoped to provider URL and credential/config identity,
   not a mutable connection index. Unknown or foreign references fail closed.
   Hosted file references recheck current local file grants, including revocation.
+  Hosted tool file/container references are checked too; unknown vector-store
+  references are rejected (this deployment keeps non-memory embeddings disabled).
   Response references can be delegated through their original live chat ACL,
   never through an untrusted client-supplied chat ID or a copied share snapshot.
 - Streaming records returned IDs before dispatching complete SSE events. JSON

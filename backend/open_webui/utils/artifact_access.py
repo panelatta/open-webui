@@ -86,6 +86,21 @@ async def validate_provider_references(payload, scope, user):
                 if k in value:
                     await visit(value[k])
 
+    # Hosted tools can reference the same private files through auto containers,
+    # existing containers, or vector stores instead of input_file content parts.
+    for tool in payload.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "file_search":
+            for store_id in tool.get("vector_store_ids") or []:
+                await require_artifact("vector_store", store_id, scope, user)
+        if tool.get("type") == "code_interpreter":
+            container = tool.get("container")
+            if isinstance(container, str):
+                await require_artifact("container", container, scope, user)
+            elif isinstance(container, dict):
+                for file_id in container.get("file_ids") or []:
+                    await require_artifact("file", file_id, scope, user)
     await visit(payload.get("input"))
     await visit(payload.get("messages"))
 
@@ -112,6 +127,16 @@ async def record_provider_response(data, scope, user, model_id, chat_id=None):
         if isinstance(item, dict) and item.get("id"):
             await SecurityArtifacts.record(
                 "item", scope, item["id"], user.id, chat_id=chat_id, model_id=model_id
+            )
+    for item in response.get("output") or []:
+        if isinstance(item, dict) and item.get("container_id"):
+            await SecurityArtifacts.record(
+                "container",
+                scope,
+                item["container_id"],
+                user.id,
+                chat_id=chat_id,
+                model_id=model_id,
             )
     conversation = response.get("conversation")
     if isinstance(conversation, dict) and conversation.get("id"):
@@ -160,6 +185,14 @@ async def owned_response_stream(stream, scope, user, model_id, chat_id=None):
                                 recorded.add(identifier)
                             # Output items can be referenced by native Responses callers.
                             item = data.get("item")
+                            if isinstance(item, dict) and item.get("container_id"):
+                                await SecurityArtifacts.record(
+                                    "container",
+                                    scope,
+                                    item["container_id"],
+                                    user.id,
+                                    model_id=model_id,
+                                )
                             if isinstance(item, dict) and item.get("id"):
                                 await SecurityArtifacts.record(
                                     "item",
