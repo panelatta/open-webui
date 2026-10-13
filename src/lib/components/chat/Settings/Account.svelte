@@ -15,6 +15,7 @@
 
 	import UpdatePassword from './Account/UpdatePassword.svelte';
 	import Mfa from './Account/Mfa.svelte';
+	import GoogleAccount from './Account/GoogleAccount.svelte';
 	import { generateInitialsImage } from '$lib/utils';
 	import { copyToClipboard } from '$lib/utils';
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
@@ -386,6 +387,9 @@
 		{/if}
 
 		<UserSettingSection title={$i18n.t('Multi-factor authentication')}><Mfa /></UserSettingSection>
+		{#if $config?.oauth?.providers?.google}
+			<UserSettingSection title={$i18n.t('Google account')}><GoogleAccount /></UserSettingSection>
+		{/if}
 
 		{#if canUseApiKeys({ user: $user, config: $config })}
 			<UserSettingSection title={$i18n.t('settings.personal.account.sections.apiKeys.title')}>

@@ -3034,6 +3034,10 @@ async def oauth_login_callback(
     3. If no match and ``ENABLE_OAUTH_SIGNUP`` is enabled, create a new user
        (fails if the email is already registered).
     """
+    from open_webui.utils.oauth_accounts import LINK_PREFIX, finish_link
+
+    if provider == 'google' and request.query_params.get('state', '').startswith(LINK_PREFIX):
+        return await finish_link(request)
     return await oauth_manager.handle_callback(request, provider, response, db=db)
 
 

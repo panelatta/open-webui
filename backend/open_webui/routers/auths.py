@@ -61,6 +61,7 @@ from open_webui.models.users import (
     Users,
 )
 from open_webui.routers.mfa import MfaRoute
+from open_webui.routers.oauth_accounts import router as oauth_accounts_router
 from open_webui.utils.access_control import get_permissions, has_permission
 from open_webui.utils.auth import (
     create_api_key,
@@ -87,6 +88,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(route_class=MfaRoute)
+router.include_router(oauth_accounts_router, prefix='/oauth/accounts')
 
 log = logging.getLogger(__name__)
 
