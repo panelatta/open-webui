@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 from typing import Optional
@@ -56,7 +55,7 @@ def get_memory_content_embedding_prompt() -> Optional[str]:
     return os.getenv('MEMORY_CONTENT_EMBEDDING_PROMPT') or None
 
 
-async def embed_memory_content(request: Request, content: str, user) -> list[float]:
+async def embed_memory_content(request: Request, content: str | list[str], user) -> list[float] | list[list[float]]:
     embedding_function = getattr(request.app.state, 'MEMORY_EMBEDDING_FUNCTION', None)
     if embedding_function is None:
         raise HTTPException(status_code=503, detail='Memory embedding function is not configured')
@@ -190,15 +189,11 @@ async def reindex_memory_vectors_for_user(
     if not memories:
         return 0
 
-    vectors = await asyncio.gather(
-        *[
-            embed_memory_content(
-                request,
-                memory_vector_text(memory.content, memory.path),
-                user=user,
-            )
-            for memory in memories
-        ]
+    # Preserve upstream batching/concurrency limits through the memory-only function.
+    vectors = await embed_memory_content(
+        request,
+        [memory_vector_text(memory.content, memory.path) for memory in memories],
+        user=user,
     )
 
     await ASYNC_VECTOR_DB_CLIENT.upsert(
@@ -530,10 +525,9 @@ async def reset_memory_from_vector_db(
     """Reset user's memory vector embeddings.
 
     CRITICAL: We intentionally do NOT use Depends(get_async_session) here.
-    This endpoint generates embeddings for ALL user memories in parallel using
-    asyncio.gather(). A user with 100 memories would trigger 100 embedding API
-    calls simultaneously. With a session held, this could block a connection
-    for MINUTES, completely exhausting the connection pool.
+    This endpoint generates embeddings for ALL user memories. With a session
+    held, this could block a connection for MINUTES, completely exhausting the
+    connection pool.
     """
     await check_memories_permission(user)
 

@@ -158,7 +158,8 @@ async def test_memory_reindex_uses_memory_function_only(monkeypatch):
 
     async def embedding(content, *, prefix=None, user=None):
         calls.append(content)
-        return [0.25, 0.75]
+        assert isinstance(content, list)
+        return [[0.25, 0.75] for _ in content]
 
     async def delete_collection(name):
         assert name == 'user-memory-policy-test'
@@ -178,7 +179,7 @@ async def test_memory_reindex_uses_memory_function_only(monkeypatch):
         memories=[memory], user=SimpleNamespace(id='policy-test'),
     )
     assert count == 1
-    assert calls == ['remember']
+    assert calls == [['remember']]
     assert upserts[0]['collection_name'] == 'user-memory-policy-test'
     assert upserts[0]['items'][0]['vector'] == [0.25, 0.75]
 

@@ -56,7 +56,7 @@ from open_webui.utils.generation_status import start_generation_status
 from open_webui.utils.reasoning_capabilities import supplement_reasoning_capabilities
 from open_webui.utils.reasoning_levels import model_chain, default_config, apply_reasoning_level, apply_client_reasoning_effort
 from open_webui.utils.json_codec import JSONCodec
-from open_webui.utils.misc import convert_logit_bias_input_to_json
+from open_webui.utils.misc import convert_logit_bias_input_to_json, get_provider_function
 from open_webui.utils.model_ids import strip_provider_model_prefix
 from open_webui.utils.payload import (
     apply_model_params_to_body_openai,
@@ -1625,6 +1625,8 @@ def _normalize_stored_item(item: dict) -> dict:
     if allowed is None:
         # Unknown type — pass through as-is (e.g. reasoning, extension items).
         return item
+    if item_type == 'function_call':
+        item = {**item, **get_provider_function(item)}
     return {k: v for k, v in item.items() if k in allowed}
 
 
@@ -1996,6 +1998,9 @@ async def generate_chat_completion(
     payload.pop('reasoning_effort_levels', None)
 
     model_id = form_data.get('model')
+    # keep the model the client asked for when reached from /api/chat/completions
+    if not hasattr(request.state, 'model_id'):
+        request.state.model_id = model_id
     model_info = await Models.get_model_by_id(model_id)
 
     reasoning_infos = {}
@@ -2776,6 +2781,7 @@ async def responses(
     is_streaming_request = bool(payload.get('stream', False))
 
     model_id = form_data.model
+    request.state.model_id = model_id
 
     # Enforce per-model access control
     model_info = await Models.get_model_by_id(model_id)
@@ -2936,6 +2942,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
 
     idx = 0
     model_id = payload.get('model') if isinstance(payload, dict) else None
+    request.state.model_id = model_id
     if model_id:
         models = request.app.state.OPENAI_MODELS
         if not models or model_id not in models:

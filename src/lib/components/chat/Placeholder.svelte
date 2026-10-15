@@ -41,6 +41,7 @@
 
 	export let autoScroll = false;
 	export let callActive = false;
+	export let callEnabled = true;
 
 	export let atSelectedModel: Model | undefined;
 	export let selectedModels: [''];
@@ -254,6 +255,7 @@
 						bind:params
 
 						{callActive}
+						{callEnabled}
 						bind:this={messageInput}
 						{history}
 						bind:selectedModels
