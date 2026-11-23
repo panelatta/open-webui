@@ -630,17 +630,19 @@ async def user_join(sid, data):
     token = auth['token']
     if bound_user_id:
         try:
-            stored = decode_token((await sio.get_session(sid) or {}).get('token') or '')
+            stored_token = (await sio.get_session(sid) or {}).get('token') or ''
         except Exception:
             return
-        candidate = decode_token(token) or {}
-        if stored and _login_of(stored) != _login_of(candidate):
-            # Another live login of the same user must not take over this connection's rooms.
-            log.info('Socket %s joined with a different login; disconnecting it.', sid)
+        stored = decode_token(stored_token)
+        candidate = decode_token(token)
+        if not stored or not candidate or _login_of(stored) != _login_of(candidate):
+            # Only a token of the very login this connection was bound with may re-join it; anything
+            # else (another login, or a stored token that no longer decodes) reconnects from scratch.
+            log.info('Socket %s re-joined with another or unverifiable login; disconnecting it.', sid)
             await sio.disconnect(sid)
             return
-        if stored and (candidate.get('exp') or 0) < (stored.get('exp') or 0):
-            token = (await sio.get_session(sid) or {}).get('token')  # Never roll back a generation.
+        if (candidate.get('exp') or 0) < (stored.get('exp') or 0):
+            token = stored_token  # Never roll back to an older generation.
     await bind_connection(sid, user, token)
 
     # Join all the channels only if user has channels permission

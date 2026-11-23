@@ -1,6 +1,7 @@
 <script lang="ts">
 	import DOMPurify from 'dompurify';
 	import { marked } from 'marked';
+	import { toast } from 'svelte-sonner';
 
 	import { getAdminDetails, getLogoutRedirectUrl, userSignOut } from '$lib/apis/auths';
 	import { onMount, tick, getContext } from 'svelte';
@@ -70,10 +71,14 @@
 					<button
 						class="text-xs text-center w-full mt-2 text-gray-400 underline"
 						on:click={async () => {
-							const res = await userSignOut().catch((err) => {
-								console.error(err);
-								return null;
-							});
+							let res;
+							try {
+								res = await userSignOut();
+							} catch (err) {
+								// Keep the session visible: the server has not confirmed it ended.
+								toast.error(`${err}`);
+								return;
+							}
 							localStorage.removeItem('token');
 							location.href = getLogoutRedirectUrl(res?.redirect_url);
 						}}>{$i18n.t('Sign Out')}</button

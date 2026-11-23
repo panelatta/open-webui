@@ -363,14 +363,16 @@ async def refresh_session(request: Request, response: Response) -> dict:
         raise HTTPException(409, CONFLICT)
 
     max_age = new_exp - now
-    response.set_cookie(
-        'token',
-        new_token,
-        httponly=True,
-        secure=WEBUI_AUTH_COOKIE_SECURE,
-        samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
-        max_age=max_age,
-    )
+    # Same forward-only rule as identity lookups: never replace a newer login's cookie.
+    if await may_write_token_cookie(request, new_token):
+        response.set_cookie(
+            'token',
+            new_token,
+            httponly=True,
+            secure=WEBUI_AUTH_COOKIE_SECURE,
+            samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+            max_age=max_age,
+        )
     set_refresh_cookie(response, claims['sid'], new_secret, max_age)
     if chain.oauth_session_id:
         oauth_session = await OAuthSessions.get_session_by_id(chain.oauth_session_id)
@@ -431,10 +433,19 @@ async def revoke_for_signout(request: Request, token: str | None, *, explicit: b
     return True
 
 
+def _login_order(claims: dict) -> tuple[int, int]:
+    """When the login was authenticated, then when this generation was issued."""
+    iat = _int(claims.get('iat')) or 0
+    return (_int(claims.get('auth_time')) or iat, iat)
+
+
 async def may_write_token_cookie(request: Request, token: str) -> bool:
-    """Identity lookups only (re)write the token cookie when it is absent, already `token`, or no longer
-    valid. A cookie holding another valid login (e.g. a fresh OAuth hand-over the auth page still has to
-    read) or a newer generation of this one is never replaced; a revoked or expired one is repaired."""
+    """The shared token cookie only ever moves forward.
+
+    It is (re)written when absent, equal to `token`, no longer valid, or older than `token` - an earlier
+    login, or an earlier generation of the same login. A newer login (e.g. the readable cookie an OAuth
+    callback hands to the auth page) is never replaced by an older one, so a late response from an older
+    login cannot take the cookie over for good: the next request with the newer Bearer moves it back."""
     cookie_token = request.cookies.get('token')
     if not cookie_token or cookie_token == token:
         return True
@@ -442,6 +453,9 @@ async def may_write_token_cookie(request: Request, token: str) -> bool:
     if not isinstance(cookie, dict) or not _str(cookie.get('id')):
         return True
     try:
-        return not await auth_utils.is_valid_token(cookie, getattr(request.app.state, 'redis', None))
+        if not await auth_utils.is_valid_token(cookie, getattr(request.app.state, 'redis', None)):
+            return True
     except HTTPException:
         return True  # The cookie's account is gone or disabled.
+    presented = auth_utils.decode_token(token)
+    return isinstance(presented, dict) and _login_order(presented) > _login_order(cookie)

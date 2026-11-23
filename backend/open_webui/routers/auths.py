@@ -935,7 +935,8 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
         auth_cred = get_http_authorization_cred(auth_header)
         if auth_cred is not None:
             token = auth_cred.credentials
-    if token is None:
+    if token is None and auth_header is None:
+        # A sent Authorization header is authoritative; only header-less sign-outs use the cookie.
         token = request.cookies.get('token')
 
     oauth_session_id = request.cookies.get('oauth_session_id')
