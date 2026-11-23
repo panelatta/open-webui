@@ -2540,6 +2540,12 @@ if JWT_EXPIRES_IN == '-1':
         '    See: https://docs.openwebui.com/reference/env-configuration\n'
     )
 
+# Sliding sessions: a first-party browser login may renew its access token with a
+# rotating HttpOnly refresh cookie until SESSION_MAX_LIFETIME after authentication.
+# Off by default; validation of renewed tokens stays active even when disabled.
+ENABLE_SESSION_REFRESH = os.getenv('ENABLE_SESSION_REFRESH', 'false').lower() == 'true'
+SESSION_MAX_LIFETIME = os.getenv('SESSION_MAX_LIFETIME', '30d')
+
 ####################################
 # OAuth config
 ####################################

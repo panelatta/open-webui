@@ -188,11 +188,19 @@ def challenge_response(token: str, challenge: MfaChallenge) -> dict:
     }
 
 
-async def start_mfa_login(auth: AuthModel, auth_method: str, *, oauth_session_id=None, provider=None) -> dict:
+async def start_mfa_login(
+    auth: AuthModel, auth_method: str, *, oauth_session_id=None, provider=None, renewable=False
+) -> dict:
     mfa = auth.mfa.model_copy(deep=True) if auth.mfa else MfaData()
     kind = 'recover' if mfa.reset_required else 'verify' if mfa.secret else 'enroll'
     token, challenge = new_challenge(
-        auth, kind, auth_method, int(time.time()), oauth_session_id=oauth_session_id, provider=provider
+        auth,
+        kind,
+        auth_method,
+        int(time.time()),
+        oauth_session_id=oauth_session_id,
+        provider=provider,
+        renewable=renewable,
     )
     mfa.login_challenge = challenge
     await save_mfa(auth, mfa)
@@ -369,6 +377,7 @@ async def redeem_mfa_reset_token(token: str, reset_token: str):
         challenge.auth_time,
         oauth_session_id=challenge.oauth_session_id,
         provider=challenge.provider,
+        renewable=challenge.renewable,
     )
     mfa.reset_ticket = None
     mfa.login_challenge = enroll

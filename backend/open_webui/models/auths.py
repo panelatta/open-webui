@@ -58,6 +58,8 @@ class MfaChallenge(BaseModel):
     secret: str | None = None
     oauth_session_id: str | None = None
     provider: str | None = None
+    # Set only by first-party browser login entry points; never by token exchange.
+    renewable: bool = False
 
 
 class MfaData(BaseModel):

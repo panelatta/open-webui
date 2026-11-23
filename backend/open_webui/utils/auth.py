@@ -250,6 +250,14 @@ def decode_token(token: str) -> dict | None:
         return None
 
 
+def decode_token_for_revocation(token: str) -> dict | None:
+    """Verify the signature but not expiry. Only for revoking what the bearer once held."""
+    try:
+        return jwt.decode(token, SESSION_SECRET, algorithms=[ALGORITHM], options={'verify_exp': False})
+    except Exception:
+        return None
+
+
 class RateLimitFilter(logging.Filter):
     """Limit a logger to one record per interval per process."""
 
@@ -281,7 +289,13 @@ async def is_valid_token(decoded, redis=None) -> bool:
 
     auth = await get_auth(decoded.get('id', ''))
     jti = decoded.get('jti')
-    if jti is not None and (not isinstance(jti, str) or await SessionRevocations.is_revoked(jti)):
+    if jti is not None and not isinstance(jti, str):
+        return False
+    # Renewed tokens carry their lineage id; revoking it revokes every generation.
+    sid = decoded.get('sid')
+    if sid is not None and (not isinstance(sid, str) or not sid):
+        return False
+    if await SessionRevocations.any_revoked([jti, sid]):
         return False
     if decoded.get('session_stamp') != auth.session_stamp:
         return False
@@ -664,8 +678,13 @@ async def create_signin_response(
     *,
     oauth_session_id=None,
     provider=None,
+    renewable=None,
 ):
-    """Gate every human login before issuing an application credential."""
+    """Gate every human login before issuing an application credential.
+
+    `renewable` marks a first-party browser login that may open a sliding-session lineage;
+    it defaults to `set_cookie` so API-style callers (e.g. token exchange) never do."""
+    renewable = bool(set_cookie) if renewable is None else bool(renewable)
     from open_webui.utils.mfa import get_auth, get_mfa_config, is_mfa_required, start_mfa_login
 
     auth = auth or await get_auth(user.id)
@@ -676,9 +695,11 @@ async def create_signin_response(
     if config.ENABLE_MFA and user.role not in {'admin', 'user'}:
         return {'next_step': 'pending'}
     if is_mfa_required(source, config):
-        return await start_mfa_login(current, source, oauth_session_id=oauth_session_id, provider=provider)
+        return await start_mfa_login(
+            current, source, oauth_session_id=oauth_session_id, provider=provider, renewable=renewable
+        )
     return await create_session_response(
-        request, user, db, response, set_cookie=set_cookie, source=source, auth=current
+        request, user, db, response, set_cookie=set_cookie, source=source, auth=current, renewable=renewable
     )
 
 
@@ -693,6 +714,8 @@ async def create_session_response(
     auth,
     mfa_verified=False,
     auth_time=None,
+    oauth_session_id=None,
+    renewable=True,
 ):
     """Issue a completed human session using the credential snapshot that authorized it."""
     import time
@@ -729,6 +752,11 @@ async def create_session_response(
             samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
             max_age=int(expires_delta.total_seconds()) if expires_delta else None,
         )
+        # Only a first-party browser login gets the rotating refresh credential.
+        if renewable:
+            from open_webui.utils.session_refresh import start_session_chain
+
+            await start_session_chain(response, token, user=user, oauth_session_id=oauth_session_id)
     await publish_event(
         request,
         EVENTS.AUTH_LOGIN,

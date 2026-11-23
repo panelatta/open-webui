@@ -5,8 +5,24 @@ import time
 
 from open_webui.internal.db import Base, get_async_db_context
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, delete, select
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    Integer,
+    String,
+    Text,
+    delete,
+    exists,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
+
+
+def digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 class RevokedSession(Base):
@@ -18,29 +34,240 @@ class RevokedSession(Base):
 class SessionRevocations:
     @staticmethod
     async def revoke(jti, expires_at=None, db=None):
-        key = hashlib.sha256(jti.encode()).hexdigest()
-        async with get_async_db_context(db) as session:
-            await session.execute(
-                delete(RevokedSession).where(
-                    RevokedSession.expires_at <= int(time.time())
-                )
-            )
-            if not await session.get(RevokedSession, key):
-                session.add(RevokedSession(id=key, expires_at=expires_at))
-            try:
-                await session.commit()
-            except IntegrityError:
-                await session.rollback()  # Concurrent sign-outs are idempotent.
+        """Revoke an identifier; an existing revocation is only ever extended (None = permanent)."""
+        key = digest(jti)
+        for _ in range(3):
+            async with get_async_db_context(db) as session:
+                try:
+                    await session.execute(
+                        delete(RevokedSession).where(
+                            RevokedSession.expires_at <= int(time.time())
+                        )
+                    )
+                    extend = update(RevokedSession).where(RevokedSession.id == key)
+                    if expires_at is not None:
+                        extend = extend.where(
+                            RevokedSession.expires_at.is_not(None),
+                            RevokedSession.expires_at < expires_at,
+                        )
+                    await session.execute(extend.values(expires_at=expires_at))
+                    present = await session.execute(
+                        select(RevokedSession.id).where(RevokedSession.id == key)
+                    )
+                    if present.scalar_one_or_none() is None:
+                        session.add(RevokedSession(id=key, expires_at=expires_at))
+                    await session.commit()
+                    return
+                except IntegrityError:
+                    # A concurrent sign-out inserted the row first; retry as an extension.
+                    await session.rollback()
+        raise RuntimeError("Session revocation could not be persisted.")
 
     @staticmethod
     async def is_revoked(jti, db=None):
+        return await SessionRevocations.any_revoked([jti], db=db)
+
+    @staticmethod
+    async def any_revoked(identifiers, db=None):
+        keys = {digest(value) for value in identifiers if value}
+        if not keys:
+            return False
         async with get_async_db_context(db) as session:
-            row = await session.get(
-                RevokedSession, hashlib.sha256(jti.encode()).hexdigest()
+            row = await session.execute(
+                select(RevokedSession.id)
+                .where(
+                    RevokedSession.id.in_(keys),
+                    or_(
+                        RevokedSession.expires_at.is_(None),
+                        RevokedSession.expires_at > int(time.time()),
+                    ),
+                )
+                .limit(1)
             )
-            return row is not None and (
-                row.expires_at is None or row.expires_at > int(time.time())
+            return row.first() is not None
+
+
+class SessionLineage(Base):
+    """One first-party interactive login whose access tokens may be renewed by a rotating refresh secret."""
+
+    __tablename__ = "session_lineage"
+    id = Column(String(64), primary_key=True)  # sha256(sid); sid is the first access token's jti
+    user_id = Column(Text, nullable=False, index=True)
+    session_stamp = Column(Text, nullable=False)
+    auth_method = Column(String(32), nullable=False)
+    auth_time = Column(BigInteger, nullable=False)
+    mfa_verified = Column(Boolean, nullable=False)
+    absolute_expires_at = Column(BigInteger, nullable=False, index=True)
+    generation = Column(Integer, nullable=False)
+    current_secret = Column(String(64), nullable=False)
+    previous_secret = Column(String(64), nullable=True)
+    current_jti = Column(String(64), nullable=False)
+    previous_jti = Column(String(64), nullable=True)
+    rotated_at = Column(BigInteger, nullable=False)
+    oauth_session_id = Column(Text, nullable=True)
+    revoked_at = Column(BigInteger, nullable=True)
+
+
+class SessionLineageModel(BaseModel):
+    id: str
+    user_id: str
+    session_stamp: str
+    auth_method: str
+    auth_time: int
+    mfa_verified: bool
+    absolute_expires_at: int
+    generation: int
+    current_secret: str
+    previous_secret: str | None = None
+    current_jti: str
+    previous_jti: str | None = None
+    rotated_at: int
+    oauth_session_id: str | None = None
+    revoked_at: int | None = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SessionChains:
+    """Persistence for session lineages. Every call uses its own short transaction."""
+
+    CLEANUP_BATCH = 100
+
+    @staticmethod
+    async def create(
+        sid,
+        *,
+        user_id,
+        session_stamp,
+        auth_method,
+        auth_time,
+        mfa_verified,
+        absolute_expires_at,
+        secret_hash,
+        jti_hash,
+        now,
+        oauth_session_id=None,
+    ):
+        async with get_async_db_context() as session:
+            expired = await session.execute(
+                select(SessionLineage.id)
+                .where(SessionLineage.absolute_expires_at < now)
+                .limit(SessionChains.CLEANUP_BATCH)
             )
+            expired_ids = list(expired.scalars())
+            if expired_ids:
+                await session.execute(
+                    delete(SessionLineage).where(SessionLineage.id.in_(expired_ids))
+                )
+            session.add(
+                SessionLineage(
+                    id=digest(sid),
+                    user_id=user_id,
+                    session_stamp=session_stamp,
+                    auth_method=auth_method,
+                    auth_time=auth_time,
+                    mfa_verified=mfa_verified,
+                    absolute_expires_at=absolute_expires_at,
+                    generation=0,
+                    current_secret=secret_hash,
+                    previous_secret=None,
+                    current_jti=jti_hash,
+                    previous_jti=None,
+                    rotated_at=now,
+                    oauth_session_id=oauth_session_id,
+                    revoked_at=None,
+                )
+            )
+            await session.commit()
+
+    @staticmethod
+    async def get(sid) -> SessionLineageModel | None:
+        async with get_async_db_context() as session:
+            row = await session.execute(
+                select(SessionLineage).where(SessionLineage.id == digest(sid))
+            )
+            row = row.scalar_one_or_none()
+            return SessionLineageModel.model_validate(row) if row else None
+
+    @staticmethod
+    async def rotate(
+        sid,
+        *,
+        user_id,
+        session_stamp,
+        old_secret,
+        old_jti,
+        new_secret,
+        new_jti,
+        now,
+    ) -> bool:
+        """Advance the lineage only if it is still at the presented generation and the account is unchanged."""
+        from open_webui.models.auths import Auth
+
+        account_unchanged = exists().where(
+            Auth.id == user_id,
+            Auth.session_stamp == session_stamp,
+            Auth.active == True,  # noqa: E712
+        )
+        async with get_async_db_context() as session:
+            result = await session.execute(
+                update(SessionLineage)
+                .where(
+                    SessionLineage.id == digest(sid),
+                    SessionLineage.user_id == user_id,
+                    SessionLineage.session_stamp == session_stamp,
+                    SessionLineage.current_secret == old_secret,
+                    SessionLineage.current_jti == old_jti,
+                    SessionLineage.revoked_at.is_(None),
+                    SessionLineage.absolute_expires_at > now,
+                    account_unchanged,
+                )
+                .values(
+                    current_secret=new_secret,
+                    previous_secret=old_secret,
+                    current_jti=new_jti,
+                    previous_jti=old_jti,
+                    generation=SessionLineage.generation + 1,
+                    rotated_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                await session.rollback()
+                return False
+            await session.commit()
+            return True
+
+    @staticmethod
+    async def mark_revoked(sid, now) -> SessionLineageModel | None:
+        async with get_async_db_context() as session:
+            await session.execute(
+                update(SessionLineage)
+                .where(
+                    SessionLineage.id == digest(sid),
+                    SessionLineage.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            row = await session.execute(
+                select(SessionLineage).where(SessionLineage.id == digest(sid))
+            )
+            row = row.scalar_one_or_none()
+            return SessionLineageModel.model_validate(row) if row else None
+
+    @staticmethod
+    async def active_user_ids(now) -> list[str]:
+        async with get_async_db_context() as session:
+            rows = await session.execute(
+                select(SessionLineage.user_id)
+                .where(
+                    SessionLineage.revoked_at.is_(None),
+                    SessionLineage.absolute_expires_at > now,
+                )
+                .distinct()
+            )
+            return list(rows.scalars())
 
 
 class SecurityArtifact(Base):

@@ -67,6 +67,11 @@ def clear_challenge_cookie(response: Response):
 
 
 async def finish_login(request, response, user, auth, challenge):
+    session = None
+    if challenge.oauth_session_id:
+        candidate = await OAuthSessions.get_session_by_id(challenge.oauth_session_id)
+        if candidate and candidate.user_id == user.id:
+            session = candidate
     result = await create_session_response(
         request,
         user,
@@ -76,19 +81,19 @@ async def finish_login(request, response, user, auth, challenge):
         auth=auth,
         mfa_verified=True,
         auth_time=challenge.auth_time,
+        oauth_session_id=session.id if session else None,
+        renewable=challenge.renewable,
     )
-    if challenge.oauth_session_id:
-        session = await OAuthSessions.get_session_by_id(challenge.oauth_session_id)
-        if session and session.user_id == user.id:
-            expires_delta = parse_duration(await Config.get('auth.jwt_expiry'))
-            response.set_cookie(
-                'oauth_session_id',
-                session.id,
-                httponly=True,
-                secure=WEBUI_AUTH_COOKIE_SECURE,
-                samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
-                max_age=int(expires_delta.total_seconds()) if expires_delta else None,
-            )
+    if session:
+        expires_delta = parse_duration(await Config.get('auth.jwt_expiry'))
+        response.set_cookie(
+            'oauth_session_id',
+            session.id,
+            httponly=True,
+            secure=WEBUI_AUTH_COOKIE_SECURE,
+            samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+            max_age=int(expires_delta.total_seconds()) if expires_delta else None,
+        )
     clear_challenge_cookie(response)
     return result
 

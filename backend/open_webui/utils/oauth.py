@@ -2259,7 +2259,13 @@ class OAuthManager:
         from open_webui.utils.auth import create_signin_response
 
         result = await create_signin_response(
-            request, user, db=db, source='oauth', oauth_session_id=session.id if session else None, provider=provider
+            request,
+            user,
+            db=db,
+            source='oauth',
+            oauth_session_id=session.id if session else None,
+            provider=provider,
+            renewable=True,  # Browser callback; the session cookie is set below.
         )
         response.headers['Cache-Control'] = 'no-store'
         if result.get('next_step'):
@@ -2304,6 +2310,12 @@ class OAuthManager:
                     secure=WEBUI_AUTH_COOKIE_SECURE,
                     **({'max_age': cookie_max_age} if cookie_max_age is not None else {}),
                 )
+            # A completed browser OAuth login may renew itself; bind the lineage to this OAuth session.
+            from open_webui.utils.session_refresh import start_session_chain
+
+            await start_session_chain(
+                response, result['token'], user=user, oauth_session_id=session.id if session else None
+            )
 
         return response
 
@@ -2463,23 +2475,17 @@ class OAuthManager:
             )
             return JSONResponse(status_code=200, content={})
 
-        # 9. Revoke tokens and delete sessions
-        redis = request.app.state.redis
-        if not redis:
-            log.warning(
-                'Back-channel logout: Redis not configured, cannot revoke JWT tokens. '
-                'OAuth sessions will be deleted but existing JWTs will remain valid until expiry.'
-            )
-
+        # 9. Revoke tokens and delete sessions. revoke_user_tokens persists account-wide
+        # revocation in the database, so it works with or without Redis and also ends
+        # every renewable session lineage of the user.
         revoked_count = 0
         for user in users_to_logout:
             sessions = await OAuthSessions.get_sessions_by_user_id(user.id, db=db)
             for oauth_session in sessions:
                 await OAuthSessions.delete_session_by_id(oauth_session.id, db=db)
 
-            if redis:
-                await revoke_user_tokens(request, user.id)
-                revoked_count += 1
+            await revoke_user_tokens(request, user.id)
+            revoked_count += 1
 
             log.info(
                 'Back-channel logout: revoked sessions for user %s (email=%s, provider=%s, sessions_deleted=%s)',

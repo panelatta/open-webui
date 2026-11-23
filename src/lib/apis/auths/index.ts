@@ -379,13 +379,38 @@ export const userSignUp = async (
 	return res;
 };
 
-export const userSignOut = async () => {
+/**
+ * Renew a first-party session. The HttpOnly refresh cookie travels with `credentials: 'include'`;
+ * the Bearer header names the access token being renewed. Never throws on HTTP errors.
+ */
+export const refreshSessionToken = async (token: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/refresh`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			Authorization: `Bearer ${token}`
+		},
+		credentials: 'include'
+	});
+	const data = await res.json().catch(() => null);
+	const retryAfter = Number(res.headers.get('Retry-After'));
+	return {
+		status: res.status,
+		data,
+		retryAfter: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null
+	};
+};
+
+// Sign-out names the token it ends, so the server revokes that login's whole renewable lineage
+// (even after expiry) instead of whatever the shared cookie currently holds.
+export const userSignOut = async (token: string | null = localStorage.token ?? null) => {
 	let error = null;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/signout`, {
 		method: 'POST',
 		headers: {
-			'Content-Type': 'application/json'
+			'Content-Type': 'application/json',
+			...(token ? { Authorization: `Bearer ${token}` } : {})
 		},
 		credentials: 'include'
 	})

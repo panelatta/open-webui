@@ -53,7 +53,7 @@ from open_webui.tasks import (
     stop_item_tasks,
 )
 from open_webui.utils.access_control import has_permission
-from open_webui.utils.auth import get_verified_user_by_token
+from open_webui.utils.auth import decode_token, get_verified_user_by_token
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.json_codec import SOCKETIO_JSON, JSONCodec, dumps_bytes
 from open_webui.utils.misc import get_output_text
@@ -517,6 +517,51 @@ async def connect(sid, environ, auth):
             await sio.enter_room(sid, f'user:{user.id}')
 
 
+async def get_bound_user_id(sid: str) -> str | None:
+    """User id an already authenticated connection is bound to, if any."""
+    try:
+        session = await sio.get_session(sid)
+    except Exception:
+        return None
+    return ((session or {}).get('user') or {}).get('id')
+
+
+@sio.on('session-token')
+async def session_token(sid, data):
+    """Swap the stored token of an authenticated connection for a renewed token of the same login.
+
+    Rooms and chat ids are untouched; a different user, a different login or an older token is refused."""
+    token = data.get('token') if isinstance(data, dict) else None
+    if not isinstance(token, str) or not token:
+        return {'ok': False}
+    try:
+        session = await sio.get_session(sid)
+    except Exception:
+        return {'ok': False}
+    bound = (session or {}).get('user') or {}
+    current = decode_token((session or {}).get('token') or '')
+    renewed = decode_token(token)
+    if not bound.get('id') or not current or not renewed:
+        return {'ok': False}
+    if (
+        renewed.get('id') != bound['id']
+        or (renewed.get('sid') or renewed.get('jti')) != (current.get('sid') or current.get('jti'))
+        or not isinstance(renewed.get('exp'), int)
+        or renewed['exp'] < (current.get('exp') or 0)
+    ):
+        return {'ok': False}
+
+    environ = sio.get_environ(sid) or {}
+    scope = environ.get('asgi.scope') or {}
+    fastapi_app = scope.get('app')
+    redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
+    user = await get_verified_user_by_token(token, redis)
+    if not user or user.id != bound['id']:
+        return {'ok': False}
+    await sio.save_session(sid, {**session, 'token': token})
+    return {'ok': True}
+
+
 @sio.on('user-join')
 async def user_join(sid, data):
     auth = data.get('auth')
@@ -529,6 +574,14 @@ async def user_join(sid, data):
     redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
     user = await get_verified_user_by_token(auth['token'], redis)
     if not user:
+        return
+
+    bound_user_id = await get_bound_user_id(sid)
+    if bound_user_id and bound_user_id != user.id:
+        # Never switch the principal of an authenticated connection (rooms, chat ids);
+        # the client reconnects with its current token instead.
+        log.info('Socket %s joined with a different account; disconnecting it.', sid)
+        await sio.disconnect(sid)
         return
 
     socket_user = {
@@ -609,6 +662,9 @@ async def join_channel(sid, data):
     user = await get_verified_user_by_token(auth['token'], redis)
     if not user:
         return
+    bound_user_id = await get_bound_user_id(sid)
+    if bound_user_id and bound_user_id != user.id:
+        return
 
     # Join all the channels only if user has channels permission
     if user.role == 'admin' or await has_permission(user.id, 'features.channels', await Config.get('user.permissions')):
@@ -630,6 +686,9 @@ async def join_note(sid, data):
     redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
     user = await get_verified_user_by_token(auth['token'], redis)
     if not user:
+        return
+    bound_user_id = await get_bound_user_id(sid)
+    if bound_user_id and bound_user_id != user.id:
         return
 
     if user.role != 'admin' and not await has_permission(

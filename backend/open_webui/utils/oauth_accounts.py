@@ -22,6 +22,11 @@ LINK_SESSION = 'google_account_link'
 LINK_SECONDS = 300
 
 
+def login_id(claims):
+    """Stable id of one browser login: renewed tokens keep `sid`, the first token's `jti`."""
+    return claims.get('sid') or claims.get('jti')
+
+
 def require_recent_human(request, user):
     claims = getattr(request.state, 'claims', {})
     age = int(time.time()) - claims.get('auth_time', 0)
@@ -48,7 +53,7 @@ async def start_link(request, user):
     claims = require_recent_human(request, user)
     # The callback must return to the same authenticated browser, not merely a bearer caller.
     cookie = decode_token(request.cookies.get('token', '')) or {}
-    if not claims.get('jti') or cookie.get('jti') != claims['jti']:
+    if not claims.get('jti') or login_id(cookie) != login_id(claims):
         raise HTTPException(403, 'reauthentication_required')
     current = await Users.get_user_by_id(user.id)
     if (current.oauth or {}).get('google'):
@@ -61,7 +66,7 @@ async def start_link(request, user):
     state = LINK_PREFIX + secrets.token_urlsafe(32)
     request.session[LINK_SESSION] = {
         'state': state, 'user_id': user.id, 'session_stamp': claims['session_stamp'],
-        'jti': claims['jti'], 'expires_at': int(time.time()) + LINK_SECONDS,
+        'jti': login_id(claims), 'expires_at': int(time.time()) + LINK_SECONDS,
     }
     redirect_uri = (client.server_metadata or {}).get('redirect_uri') or str(
         request.url_for('oauth_login_callback', provider='google')
@@ -139,7 +144,7 @@ async def finish_link(request):
         if (
             user.id != intent['user_id']
             or claims.get('session_stamp') != intent['session_stamp']
-            or claims.get('jti') != intent['jti']
+            or login_id(claims) != intent['jti']
         ):
             raise HTTPException(403, 'The signed-in account changed.')
         from open_webui.utils.oauth import get_oauth_runtime_config

@@ -83,6 +83,11 @@ from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.mfa import MFA_CONFIG_KEYS, MfaConfigForm, get_mfa_config, limit_account, update_mfa_config
 from open_webui.utils.misc import parse_duration, validate_email_format
 from open_webui.utils.rate_limit import RateLimiter
+from open_webui.utils.session_refresh import (
+    clear_refresh_cookie,
+    refresh_session,
+    revoke_for_signout,
+)
 from pydantic import BaseModel, StrictStr, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -204,17 +209,19 @@ async def get_session_user(
                 detail=ERROR_MESSAGES.INVALID_TOKEN,
             )
 
-        # Set the cookie token
-        max_age = int(expires_at - time.time()) if expires_at else None
-        response.set_cookie(
-            key='token',
-            value=token,
-            expires=(datetime.datetime.fromtimestamp(expires_at, datetime.timezone.utc) if expires_at else None),
-            httponly=True,  # Ensures the cookie is not accessible via JavaScript
-            samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
-            secure=WEBUI_AUTH_COOKIE_SECURE,
-            **({'max_age': max_age} if max_age is not None else {}),
-        )
+        # Only (re)write the cookie when it is absent or already this token: an identity
+        # lookup must never replace another login's or a newer generation's cookie.
+        if request.cookies.get('token') in (None, token):
+            max_age = int(expires_at - time.time()) if expires_at else None
+            response.set_cookie(
+                key='token',
+                value=token,
+                expires=(datetime.datetime.fromtimestamp(expires_at, datetime.timezone.utc) if expires_at else None),
+                httponly=True,  # Ensures the cookie is not accessible via JavaScript
+                samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+                secure=WEBUI_AUTH_COOKIE_SECURE,
+                **({'max_age': max_age} if max_age is not None else {}),
+            )
 
     user_permissions = await get_permissions(user.id, await Config.get('user.permissions'), db=db)
 
@@ -237,6 +244,18 @@ async def get_session_user(
     }
 
     return response_data
+
+
+############################
+# Sliding Session Refresh
+############################
+
+
+@router.post('/refresh')
+async def refresh_session_token(request: Request, response: Response):
+    """Renew a first-party browser session: needs the Bearer access token *and* the rotating
+    HttpOnly refresh cookie issued at interactive login. See utils/session_refresh.py."""
+    return await refresh_session(request, response)
 
 
 ############################
@@ -935,6 +954,10 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
             subject_type='user' if actor else None,
             **({'source': 'oauth', 'data': {'auth_method': 'oauth', 'provider': session.provider}} if session else {}),
         )
+
+    # End the whole renewable lineage, even when the presented token has already expired.
+    if await revoke_for_signout(request, token):
+        clear_refresh_cookie(response)
 
     response.delete_cookie('token')
     try:

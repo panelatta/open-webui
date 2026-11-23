@@ -54,7 +54,21 @@
 	import 'tippy.js/dist/tippy.css';
 
 	import { executeToolServer, getBackendConfig, getModels, getVersion } from '$lib/apis';
-	import { getSessionUser, updateUserTimezone, userSignOut } from '$lib/apis/auths';
+	import {
+		getSessionUser,
+		refreshSessionToken,
+		updateUserTimezone,
+		userSignOut
+	} from '$lib/apis/auths';
+	import {
+		decodeJwtClaims,
+		expiryBuffer,
+		networkRetryDelay,
+		REFRESH_HALT_KEY,
+		REFRESH_LOCK_NAME,
+		sameLogin,
+		shouldRefresh
+	} from '$lib/utils/sessionRefresh';
 	import { getAllTags } from '$lib/apis/chats';
 	import { chatCompletion } from '$lib/apis/openai';
 	import { isTemporaryChatId } from '$lib/utils/chatId';
@@ -994,7 +1008,7 @@
 		}
 	};
 
-	const clearExpiredSession = () => {
+	const clearExpiredSession = (expiredToken = localStorage.token ?? null) => {
 		if (isAuthRedirectInProgress) {
 			return;
 		}
@@ -1008,19 +1022,20 @@
 		localStorage.removeItem('token');
 		// Clear the OAuth token cookie so /auth doesn't auto-login and redirect-loop
 		document.cookie = 'token=; Max-Age=0; path=/';
-		userSignOut().catch((error) => {
+		// Name the expired token so the server ends exactly that login's renewable lineage.
+		userSignOut(expiredToken).catch((error) => {
 			console.error('Error signing out expired session:', error);
 		});
 		toast.error($i18n.t('Session expired. Please sign in again.'));
 		isAuthRedirectInProgress = false;
 	};
 
-	const isCurrentSessionUnauthorized = async (originalFetch) => {
+	const isCurrentSessionUnauthorized = async (originalFetch, token = localStorage.token) => {
 		return originalFetch(`${WEBUI_API_BASE_URL}/auths/`, {
 			method: 'GET',
 			headers: {
 				'Content-Type': 'application/json',
-				Authorization: `Bearer ${localStorage.token}`
+				Authorization: `Bearer ${token}`
 			},
 			credentials: 'include'
 		})
@@ -1028,19 +1043,191 @@
 			.catch(() => false);
 	};
 
+	// --- Sliding session renewal -------------------------------------------------------
+	// Seconds; activity is local time, token times are corrected by the server clock offset.
+	let lastActivityAt = 0;
+	let serverClockOffset = 0;
+	let refreshInFlight = false;
+	const refreshBlockedUntil = new Map(); // jti -> server-adjusted seconds
+	const refreshNetworkFailures = new Map(); // jti -> count
+
+	const localNowSeconds = () => Math.floor(Date.now() / 1000);
+	const serverNowSeconds = () => localNowSeconds() + serverClockOffset;
+
+	const markUserActivity = (event) => {
+		if (event?.isTrusted) {
+			lastActivityAt = localNowSeconds();
+		}
+	};
+
+	const isRefreshHalted = (jti) => {
+		try {
+			return localStorage.getItem(REFRESH_HALT_KEY) === jti;
+		} catch {
+			return true;
+		}
+	};
+
+	// Never renew this token again in any tab: it simply expires as it would without renewal.
+	const haltRefresh = (jti) => {
+		try {
+			localStorage.setItem(REFRESH_HALT_KEY, jti);
+		} catch {
+			// Storage unavailable: the in-memory block below still applies to this tab.
+		}
+		refreshBlockedUntil.set(jti, Number.POSITIVE_INFINITY);
+	};
+
+	const adoptRenewedToken = (token, expiresAt) => {
+		localStorage.token = token;
+		user.update((value) => (value ? { ...value, token, expires_at: expiresAt } : value));
+		// Same connection, same rooms: only swap the token the server re-validates every 30 s.
+		$socket?.emit('session-token', { token });
+		if (window.electronAPI?.send) {
+			window.electronAPI.send({ type: 'token:update', token }).catch(() => {});
+		}
+	};
+
+	const refreshWithToken = async (token, claims) => {
+		// Another tab may have renewed or signed out while this one waited for the lock.
+		if (localStorage.token !== token || isRefreshHalted(claims.jti)) {
+			return;
+		}
+
+		let result;
+		try {
+			result = await refreshSessionToken(token);
+		} catch (error) {
+			const failures = (refreshNetworkFailures.get(claims.jti) ?? 0) + 1;
+			refreshNetworkFailures.set(claims.jti, failures);
+			const delay = networkRetryDelay(failures);
+			if (delay === null) {
+				haltRefresh(claims.jti);
+			} else {
+				refreshBlockedUntil.set(claims.jti, serverNowSeconds() + delay);
+			}
+			console.warn('Session refresh failed:', error);
+			return;
+		}
+
+		// Results for a token this browser no longer uses are stale: drop them.
+		if (localStorage.token !== token) {
+			return;
+		}
+
+		const { status, data, retryAfter } = result;
+		if (status === 200 && data?.refreshed === true && typeof data.token === 'string') {
+			if (typeof data.server_time === 'number') {
+				serverClockOffset = data.server_time - localNowSeconds();
+			}
+			const renewed = decodeJwtClaims(data.token);
+			if (sameLogin(claims, renewed)) {
+				adoptRenewedToken(data.token, data.expires_at ?? renewed.exp);
+			}
+			return;
+		}
+		if (status === 429) {
+			refreshBlockedUntil.set(claims.jti, serverNowSeconds() + (retryAfter ?? 60));
+			return;
+		}
+		// 401: the global 401 handler re-checks the access token and signs out only if it is
+		// invalid. refreshed:false (absolute lifetime), 403 (not renewable) and 409 (renewed
+		// elsewhere, not visible here) are final for this token as well.
+		haltRefresh(claims.jti);
+	};
+
+	const maybeRefreshSession = async () => {
+		if (refreshInFlight || isAuthRedirectInProgress || !$user) {
+			return;
+		}
+		const token = localStorage.token;
+		const claims = decodeJwtClaims(token);
+		if (
+			!claims?.jti ||
+			!shouldRefresh({
+				claims,
+				now: serverNowSeconds(),
+				idleSeconds: localNowSeconds() - lastActivityAt
+			}) ||
+			isRefreshHalted(claims.jti) ||
+			(refreshBlockedUntil.get(claims.jti) ?? 0) > serverNowSeconds()
+		) {
+			return;
+		}
+
+		refreshInFlight = true;
+		try {
+			if (navigator.locks?.request) {
+				// Only one tab renews at a time; the others pick the new token up via `storage`.
+				await navigator.locks.request(REFRESH_LOCK_NAME, { ifAvailable: true }, async (lock) => {
+					if (lock) {
+						await refreshWithToken(token, claims);
+					}
+				});
+			} else {
+				await refreshWithToken(token, claims);
+			}
+		} catch (error) {
+			console.warn('Session refresh error:', error);
+		} finally {
+			refreshInFlight = false;
+		}
+	};
+
+	// Another tab renewed, signed in, signed out or cleared storage.
+	const handleTokenStorageChange = (event) => {
+		if (event.storageArea !== localStorage || (event.key !== null && event.key !== 'token')) {
+			return;
+		}
+		const next = localStorage.token ?? null;
+		const current = $user?.token ?? null;
+		if (next === current || (!$user && !next)) {
+			return;
+		}
+		const currentClaims = decodeJwtClaims(current);
+		const nextClaims = decodeJwtClaims(next);
+		if ($user && next && sameLogin(currentClaims, nextClaims) && (nextClaims.exp ?? 0) >= (currentClaims.exp ?? 0)) {
+			user.update((value) => (value ? { ...value, token: next, expires_at: nextClaims.exp } : value));
+			$socket?.emit('session-token', { token: next });
+			return;
+		}
+		// A different user or login: rebuild identity, socket and caches from scratch.
+		location.reload();
+	};
+
 	const checkTokenExpiry = async () => {
-		const exp = $user?.expires_at; // token expiry time in unix timestamp
-		const now = Math.floor(Date.now() / 1000); // current time in unix timestamp
+		const token = localStorage.token ?? null;
+		const claims = decodeJwtClaims(token);
+		// The shared token is authoritative: another tab may have renewed it.
+		const exp = claims?.exp ?? $user?.expires_at; // token expiry time in unix timestamp
+		const now = serverNowSeconds();
 
 		if (!exp) {
 			// If no expiry time is set, do nothing
 			return;
 		}
 
-		if (now >= exp - TOKEN_EXPIRY_BUFFER) {
-			clearExpiredSession();
+		if (now >= exp - (claims ? expiryBuffer(claims) : TOKEN_EXPIRY_BUFFER)) {
+			clearExpiredSession(token);
+			return;
 		}
+
+		await maybeRefreshSession();
 	};
+
+	onMount(() => {
+		const activityEvents = ['pointerdown', 'keydown', 'wheel', 'touchstart'];
+		for (const name of activityEvents) {
+			window.addEventListener(name, markUserActivity, { capture: true, passive: true });
+		}
+		window.addEventListener('storage', handleTokenStorageChange);
+		return () => {
+			for (const name of activityEvents) {
+				window.removeEventListener(name, markUserActivity, { capture: true });
+			}
+			window.removeEventListener('storage', handleTokenStorageChange);
+		};
+	});
 
 	const desktopEventHandler = async (event) => {
 		// Events that don't require auth
@@ -1146,13 +1333,12 @@
 		window.fetch = async (input, init) => {
 			const response = await originalFetch(input, init);
 
-			if (
-				response.status === 401 &&
-				localStorage.token &&
-				isAuthenticatedBackendFetch(input, init) &&
-				(await isCurrentSessionUnauthorized(originalFetch))
-			) {
-				clearExpiredSession();
+			if (response.status === 401 && localStorage.token && isAuthenticatedBackendFetch(input, init)) {
+				const token = localStorage.token;
+				// Only clear the login that was re-checked; a newer login may have replaced it meanwhile.
+				if ((await isCurrentSessionUnauthorized(originalFetch, token)) && localStorage.token === token) {
+					clearExpiredSession(token);
+				}
 			}
 
 			return response;
@@ -1357,7 +1543,8 @@
 
 				if (localStorage.token) {
 					// Get Session User Info
-					const sessionUser = await getSessionUser(localStorage.token).catch((error) => {
+					const startupToken = localStorage.token;
+					const sessionUser = await getSessionUser(startupToken).catch((error) => {
 						toast.error(`${error}`);
 						return null;
 					});
@@ -1385,7 +1572,8 @@
 								})
 								.catch(() => {});
 						}
-					} else {
+					} else if (localStorage.token === startupToken) {
+						// Only discard the token that failed; another tab may have signed in meanwhile.
 						localStorage.removeItem('token');
 						await user.set(null);
 					}
