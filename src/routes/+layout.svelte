@@ -1008,6 +1008,7 @@
 		}
 	};
 
+	/** @param {string | null} [expiredToken] */
 	const clearExpiredSession = (expiredToken = localStorage.token ?? null) => {
 		if (isAuthRedirectInProgress) {
 			return;
@@ -1030,6 +1031,10 @@
 		isAuthRedirectInProgress = false;
 	};
 
+	/**
+	 * @param {typeof fetch} originalFetch
+	 * @param {string} [token]
+	 */
 	const isCurrentSessionUnauthorized = async (originalFetch, token = localStorage.token) => {
 		return originalFetch(`${WEBUI_API_BASE_URL}/auths/`, {
 			method: 'GET',
@@ -1054,12 +1059,14 @@
 	const localNowSeconds = () => Math.floor(Date.now() / 1000);
 	const serverNowSeconds = () => localNowSeconds() + serverClockOffset;
 
+	/** @param {Event} event */
 	const markUserActivity = (event) => {
 		if (event?.isTrusted) {
 			lastActivityAt = localNowSeconds();
 		}
 	};
 
+	/** @param {string} jti */
 	const isRefreshHalted = (jti) => {
 		try {
 			return localStorage.getItem(REFRESH_HALT_KEY) === jti;
@@ -1069,6 +1076,7 @@
 	};
 
 	// Never renew this token again in any tab: it simply expires as it would without renewal.
+	/** @param {string} jti */
 	const haltRefresh = (jti) => {
 		try {
 			localStorage.setItem(REFRESH_HALT_KEY, jti);
@@ -1078,6 +1086,10 @@
 		refreshBlockedUntil.set(jti, Number.POSITIVE_INFINITY);
 	};
 
+	/**
+	 * @param {string} token
+	 * @param {number | null} expiresAt
+	 */
 	const adoptRenewedToken = (token, expiresAt) => {
 		localStorage.token = token;
 		user.update((value) => (value ? { ...value, token, expires_at: expiresAt } : value));
@@ -1088,6 +1100,10 @@
 		}
 	};
 
+	/**
+	 * @param {string} token
+	 * @param {import('$lib/utils/sessionRefresh').TokenClaims & { jti: string }} claims
+	 */
 	const refreshWithToken = async (token, claims) => {
 		// Another tab may have renewed or signed out while this one waited for the lock.
 		if (localStorage.token !== token || isRefreshHalted(claims.jti)) {
@@ -1121,7 +1137,7 @@
 				serverClockOffset = data.server_time - localNowSeconds();
 			}
 			const renewed = decodeJwtClaims(data.token);
-			if (sameLogin(claims, renewed)) {
+			if (renewed && sameLogin(claims, renewed)) {
 				adoptRenewedToken(data.token, data.expires_at ?? renewed.exp);
 			}
 			return;
@@ -1143,7 +1159,8 @@
 		const token = localStorage.token;
 		const claims = decodeJwtClaims(token);
 		if (
-			!claims?.jti ||
+			!claims ||
+			!claims.jti ||
 			!shouldRefresh({
 				claims,
 				now: serverNowSeconds(),
@@ -1161,11 +1178,11 @@
 				// Only one tab renews at a time; the others pick the new token up via `storage`.
 				await navigator.locks.request(REFRESH_LOCK_NAME, { ifAvailable: true }, async (lock) => {
 					if (lock) {
-						await refreshWithToken(token, claims);
+						await refreshWithToken(token, /** @type {any} */ (claims));
 					}
 				});
 			} else {
-				await refreshWithToken(token, claims);
+				await refreshWithToken(token, /** @type {any} */ (claims));
 			}
 		} catch (error) {
 			console.warn('Session refresh error:', error);
@@ -1175,19 +1192,28 @@
 	};
 
 	// Another tab renewed, signed in, signed out or cleared storage.
+	/** @param {StorageEvent} event */
 	const handleTokenStorageChange = (event) => {
 		if (event.storageArea !== localStorage || (event.key !== null && event.key !== 'token')) {
 			return;
 		}
 		const next = localStorage.token ?? null;
-		const current = $user?.token ?? null;
+		const current = /** @type {{ token?: string } | null | undefined} */ ($user)?.token ?? null;
 		if (next === current || (!$user && !next)) {
 			return;
 		}
 		const currentClaims = decodeJwtClaims(current);
 		const nextClaims = decodeJwtClaims(next);
-		if ($user && next && sameLogin(currentClaims, nextClaims) && (nextClaims.exp ?? 0) >= (currentClaims.exp ?? 0)) {
-			user.update((value) => (value ? { ...value, token: next, expires_at: nextClaims.exp } : value));
+		if (
+			$user &&
+			next &&
+			currentClaims &&
+			nextClaims &&
+			sameLogin(currentClaims, nextClaims) &&
+			(nextClaims.exp ?? 0) >= (currentClaims.exp ?? 0)
+		) {
+			const expiresAt = nextClaims.exp;
+			user.update((value) => (value ? { ...value, token: next, expires_at: expiresAt } : value));
 			$socket?.emit('session-token', { token: next });
 			return;
 		}
