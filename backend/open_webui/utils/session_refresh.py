@@ -27,7 +27,7 @@ from open_webui.env import (
 )
 from open_webui.models.config import Config
 from open_webui.models.oauth_sessions import OAuthSessions
-from open_webui.models.security import SessionChains, SessionRevocations, digest
+from open_webui.models.security import AuthHandoffs, SessionChains, SessionRevocations, digest
 from open_webui.models.users import Users
 from open_webui.utils import auth as auth_utils
 from open_webui.utils.misc import parse_duration
@@ -40,11 +40,14 @@ log = logging.getLogger(__name__)
 REFRESH_COOKIE_PREFIX = 'owui_sr_'
 LEGACY_REFRESH_COOKIE = 'owui_session_refresh'
 REFRESH_COOKIE_PATH = '/api/v1/auths'
-# One-time OAuth sign-in hand-over: the callback parks the new token here (HttpOnly, path-scoped, short
-# lived) instead of in the shared, JS-readable `token` cookie; POST /api/v1/auths/oauth/handoff consumes it.
+# One-time OAuth sign-in hand-over: the callback stores the new token encrypted under a random ticket
+# (single use, short lived), gives the browser the ticket in an HttpOnly, path-scoped cookie and binds it
+# to the browser's signed server session; POST /api/v1/auths/oauth/handoff consumes it exactly once.
 HANDOFF_COOKIE = 'owui_oauth_handoff'
 HANDOFF_COOKIE_PATH = '/api/v1/auths/oauth/handoff'
+HANDOFF_SESSION_KEY = 'owui_oauth_handoff'
 HANDOFF_MAX_AGE = 120
+MAX_BROWSER_CREDENTIALS = 20
 REUSE_GRACE_SECONDS = 120
 MIN_REFRESH_INTERVAL_SECONDS = 30
 MIN_ACCESS_LIFETIME_SECONDS = 300
@@ -138,16 +141,26 @@ def browser_refresh_credentials(request: Request) -> dict[str, tuple[str, str]]:
     """sid -> (cookie name, secret) for every well-formed refresh credential this browser sent."""
     found = {}
     for name, value in request.cookies.items():
+        if len(found) >= MAX_BROWSER_CREDENTIALS:
+            break
         if name.startswith(REFRESH_COOKIE_PREFIX):
             sid = name[len(REFRESH_COOKIE_PREFIX) :]
             if _COOKIE_PART.fullmatch(sid) and value and _COOKIE_PART.fullmatch(value):
                 found[sid] = (name, value)
-    legacy = request.cookies.get(LEGACY_REFRESH_COOKIE)
-    if legacy and len(legacy) <= 256:
-        sid, separator, secret = legacy.partition('.')
-        if separator and _COOKIE_PART.fullmatch(sid) and _COOKIE_PART.fullmatch(secret):
-            found.setdefault(sid, (LEGACY_REFRESH_COOKIE, secret))
+    sid = legacy_refresh_sid(request)
+    if sid and len(found) < MAX_BROWSER_CREDENTIALS:
+        found.setdefault(sid, (LEGACY_REFRESH_COOKIE, request.cookies[LEGACY_REFRESH_COOKIE].partition('.')[2]))
     return found
+
+
+def legacy_refresh_sid(request: Request) -> str | None:
+    legacy = request.cookies.get(LEGACY_REFRESH_COOKIE)
+    if not legacy or len(legacy) > 256:
+        return None
+    sid, separator, secret = legacy.partition('.')
+    if separator and _COOKIE_PART.fullmatch(sid) and _COOKIE_PART.fullmatch(secret):
+        return sid
+    return None
 
 
 def set_refresh_cookie(response: Response, sid: str, secret: str, max_age: int):
@@ -172,10 +185,10 @@ def clear_refresh_cookie(response: Response, name: str):
     )
 
 
-def set_oauth_handoff(response: Response, token: str):
+def _set_handoff_cookie(response: Response, ticket: str):
     response.set_cookie(
         HANDOFF_COOKIE,
-        token,
+        ticket,
         max_age=HANDOFF_MAX_AGE,
         path=HANDOFF_COOKIE_PATH,
         httponly=True,
@@ -207,12 +220,33 @@ def login_id(claims: dict) -> str | None:
     return _str(claims.get('sid')) or _str(claims.get('jti'))
 
 
-async def supersede_browser_lineages(request: Request, response: Response, keep_sid: str | None) -> list[str]:
-    """A new first-party login in this browser ends the browser's earlier renewable logins.
+async def newer_browser_login(request: Request, auth_time: int, keep_sid: str | None) -> bool:
+    """Whether this browser proves possession of a live login authenticated after `auth_time`."""
+    now = int(time.time())
+    for sid, (_, secret) in browser_refresh_credentials(request).items():
+        if sid == keep_sid:
+            continue
+        chain = await SessionChains.get(sid)
+        if (
+            chain
+            and chain.revoked_at is None
+            and chain.absolute_expires_at > now
+            and _holds(chain, secret)
+            and chain.auth_time > auth_time
+        ):
+            return True
+    return False
 
-    Their refresh cookies (sent because they are scoped to /api/v1/auths) prove possession: those lineages
-    are revoked and every other refresh cookie is cleared, so late responses of a previous login can neither
-    renew it nor carry its identity back into the shared cookies. Never fails the login itself."""
+
+async def supersede_browser_lineages(
+    request: Request, response: Response, keep_sid: str | None, *, auth_time: int
+) -> list[str]:
+    """A new first-party login in this browser ends the browser's *earlier* renewable logins.
+
+    Their refresh cookies (sent because they are scoped to /api/v1/auths) prove possession. Lineages
+    authenticated strictly before `auth_time` are revoked and their cookies cleared, so late responses of a
+    previous login can neither renew it nor carry its identity back. Cookies of logins that are already over
+    are cleared too; later or same-second logins are left alone. Never fails the login itself."""
     if request is None or response is None:
         return []
     ended = []
@@ -222,12 +256,17 @@ async def supersede_browser_lineages(request: Request, response: Response, keep_
             continue
         try:
             chain = await SessionChains.get(sid)
-            if chain and chain.revoked_at is None and _holds(chain, secret):
-                await revoke_lineage(sid, now, reason='superseded by a new login in this browser')
-                ended.append(sid)
+            if chain is None or chain.revoked_at is not None or chain.absolute_expires_at <= now:
+                clear_refresh_cookie(response, name)
+                continue
+            if not _holds(chain, secret) or chain.auth_time >= auth_time:
+                continue
+            await revoke_lineage(sid, now, reason='superseded by a newer login in this browser')
+            ended.append(sid)
+            clear_refresh_cookie(response, name)
         except Exception:
+            # Keep the cookie: it is still needed to retry ending (or to use) that login.
             log.exception('Could not end an earlier login of this browser; continuing with the new login.')
-        clear_refresh_cookie(response, name)
     return ended
 
 
@@ -264,7 +303,7 @@ async def start_session_chain(request, response, token: str, *, user, oauth_sess
     except Exception:
         log.exception('Could not start a renewable session; the login continues without sliding renewal.')
         return False
-    await supersede_browser_lineages(request, response, keep_sid=claims['sid'])
+    await supersede_browser_lineages(request, response, keep_sid=claims['sid'], auth_time=claims['auth_time'])
     set_refresh_cookie(response, claims['sid'], secret, claims['exp'] - now)
     return True
 
@@ -367,7 +406,7 @@ async def refresh_session(request: Request, response: Response) -> dict:
     if credential is None:
         # No refresh credential for this login in this browser (missing, malformed, other logins only).
         raise HTTPException(403, UNAVAILABLE)
-    cookie_name, presented_secret = credential
+    _, presented_secret = credential
     chain = await SessionChains.get(claims['sid'])
     if chain is None:
         raise HTTPException(403, UNAVAILABLE)
@@ -449,8 +488,8 @@ async def refresh_session(request: Request, response: Response) -> dict:
             max_age=max_age,
         )
     set_refresh_cookie(response, claims['sid'], new_secret, max_age)
-    if cookie_name == LEGACY_REFRESH_COOKIE:
-        clear_refresh_cookie(response, LEGACY_REFRESH_COOKIE)
+    if legacy_refresh_sid(request) == claims['sid']:
+        clear_refresh_cookie(response, LEGACY_REFRESH_COOKIE)  # migrated to the per-login name
     # Only extend this login's own OAuth session cookie, never replace another login's.
     if chain.oauth_session_id and request.cookies.get('oauth_session_id') in (None, chain.oauth_session_id):
         oauth_session = await OAuthSessions.get_session_by_id(chain.oauth_session_id)
@@ -513,18 +552,23 @@ async def revoke_for_signout(request: Request, token: str | None, *, explicit: b
     return names
 
 
-def signout_bearer(auth_header: str) -> str:
-    """The credential of a sent Authorization header, validated before sign-out has any side effect."""
-    scheme, separator, credential = auth_header.partition(' ')
+def signout_bearer(request: Request) -> str:
+    """The one signed session JWT a sign-out names, validated before sign-out has any side effect."""
+    values = request.headers.getlist('authorization')
+    if len(values) != 1:
+        raise HTTPException(400, 'Invalid Authorization header.')
+    scheme, separator, credential = values[0].partition(' ')
     if (
         not separator
         or scheme.lower() != 'bearer'
         or not credential
         or credential != credential.strip()
         or ' ' in credential
+        or credential.startswith('sk-')
     ):
         raise HTTPException(400, 'Invalid Authorization header.')
-    if not credential.startswith('sk-') and auth_utils.decode_token_for_revocation(credential) is None:
+    claims = auth_utils.decode_token_for_revocation(credential)
+    if not isinstance(claims, dict) or claims.get('typ', 'session') != 'session' or not _str(claims.get('id')):
         raise HTTPException(401, ERROR_MESSAGES.INVALID_TOKEN)
     return credential
 
@@ -554,38 +598,82 @@ async def browser_cookies_belong_to(request: Request, token: str | None, explici
         return False
 
 
+async def issue_oauth_handoff(request: Request, response: Response, token: str) -> bool:
+    """Park a just-issued OAuth session token for one-time pick-up by the auth page of this browser."""
+    from open_webui.utils.mfa import cipher
+
+    claims = auth_utils.decode_token(token)
+    if not isinstance(claims, dict) or not _str(claims.get('id')):
+        return False
+    now = int(time.time())
+    ticket = secrets.token_urlsafe(32)
+    await AuthHandoffs.create(
+        digest(ticket),
+        user_id=claims['id'],
+        auth_time=_int(claims.get('auth_time')) or _int(claims.get('iat')) or now,
+        token_ciphertext=cipher().encrypt(token.encode()).decode(),
+        expires_at=now + HANDOFF_MAX_AGE,
+        now=now,
+    )
+    request.session[HANDOFF_SESSION_KEY] = digest(ticket)
+    _set_handoff_cookie(response, ticket)
+    return True
+
+
 async def complete_oauth_handoff(request: Request, response: Response):
-    """Consume the one-time OAuth hand-over cookie: (user, token, claims) of the login it carries."""
-    await require_first_party_origin(request)
-    raw = request.cookies.get(HANDOFF_COOKIE)
-    if not raw:
+    """Consume the one-time OAuth hand-over: (user, token, claims) of the login it carries."""
+    from open_webui.utils.mfa import cipher
+
+    await require_first_party_origin(request)  # Refused requests leave the pending hand-over alone.
+    ticket = request.cookies.get(HANDOFF_COOKIE)
+    if not ticket:
         raise HTTPException(404, 'No pending sign-in.')
     clear_oauth_handoff(response)
-    decoded = auth_utils.decode_token(raw)
+    try:
+        expected = request.session.pop(HANDOFF_SESSION_KEY, None)
+    except AssertionError:
+        expected = None  # No server session: the hand-over cannot be bound to this browser.
+    if (
+        not _COOKIE_PART.fullmatch(ticket)
+        or not isinstance(expected, str)
+        or not hmac.compare_digest(expected, digest(ticket))
+    ):
+        raise HTTPException(401, 'Sign-in expired or already used. Please sign in again.')
+    now = int(time.time())
+    pending = await AuthHandoffs.consume(digest(ticket), now)
+    if pending is None:
+        raise HTTPException(401, 'Sign-in expired or already used. Please sign in again.')
+    user_id, auth_time, ciphertext = pending
+    try:
+        token = cipher().decrypt(ciphertext.encode()).decode()
+    except Exception:
+        raise HTTPException(401, ERROR_MESSAGES.INVALID_TOKEN) from None
+    decoded = auth_utils.decode_token(token)
     if (
         not isinstance(decoded, dict)
         or decoded.get('typ', 'session') != 'session'
-        or not _str(decoded.get('id'))
+        or decoded.get('id') != user_id
         or not await auth_utils.is_valid_token(decoded, getattr(request.app.state, 'redis', None))
     ):
         raise HTTPException(401, ERROR_MESSAGES.INVALID_TOKEN)
-    issued_at = _int(decoded.get('iat'))
-    if issued_at is None or int(time.time()) - issued_at > HANDOFF_MAX_AGE + CLOCK_SKEW_SECONDS:
-        raise HTTPException(401, 'Sign-in expired. Please sign in again.')
-    user = await Users.get_user_by_id(decoded['id'])
+    user = await Users.get_user_by_id(user_id)
     if user is None:
         raise HTTPException(401, ERROR_MESSAGES.INVALID_TOKEN)
-    await supersede_browser_lineages(request, response, keep_sid=login_id(decoded))
-    if await may_write_token_cookie(request, raw):
+    keep_sid = login_id(decoded)
+    if await newer_browser_login(request, auth_time, keep_sid):
+        # A later sign-in already completed in this browser: this hand-over is stale.
+        raise HTTPException(409, 'A newer sign-in is already active in this browser.')
+    await supersede_browser_lineages(request, response, keep_sid=keep_sid, auth_time=auth_time)
+    if await may_write_token_cookie(request, token):
         response.set_cookie(
             'token',
-            raw,
+            token,
             httponly=True,
             secure=WEBUI_AUTH_COOKIE_SECURE,
             samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
-            max_age=max(0, (_int(decoded.get('exp')) or 0) - int(time.time())),
+            max_age=max(0, (_int(decoded.get('exp')) or 0) - now),
         )
-    return user, raw, decoded
+    return user, token, decoded
 
 
 def _is_newer(presented: dict, cookie: dict) -> bool:

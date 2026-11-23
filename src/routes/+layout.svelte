@@ -1674,7 +1674,13 @@
 			if ($config) {
 				await setupSocket($config.features?.enable_websocket ?? true);
 
-				if (localStorage.token) {
+				// An OAuth sign-in hand-over is pending: let the auth page complete it instead of
+				// restoring an older login first.
+				const oauthHandoffPending =
+					window.location.pathname.replace(/\/+$/, '').endsWith('/auth') &&
+					new URLSearchParams(window.location.search).has('handoff');
+
+				if (localStorage.token && !oauthHandoffPending) {
 					// Get Session User Info
 					const startupToken = localStorage.token;
 					const sessionUser = await getSessionUser(startupToken).catch((error) => {

@@ -584,14 +584,18 @@
 				type="button"
 				on:click={async () => {
 					let res;
+					const signedOutToken = localStorage.token ?? null;
 					try {
-						res = await userSignOut();
+						res = await userSignOut(signedOutToken);
 					} catch (error) {
 						// Keep the session visible: the server has not confirmed it ended.
 						toast.error(`${error}`);
 						return;
 					}
-					localStorage.removeItem('token');
+					// Another tab may have signed in meanwhile: only drop the login that was ended.
+					if (localStorage.token === signedOutToken) {
+						localStorage.removeItem('token');
+					}
 
 					location.href = getLogoutRedirectUrl(res?.redirect_url);
 					show = false;

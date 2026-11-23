@@ -391,3 +391,70 @@ class SecurityArtifacts:
                 or row.local_file_id != local_file_id
             ):
                 raise HTTPException(403, "Artifact ownership conflict.")
+
+
+class AuthHandoff(Base):
+    """A pending OAuth sign-in hand-over: consumed exactly once by the browser that completed the callback."""
+
+    __tablename__ = "auth_handoff"
+    id = Column(String(64), primary_key=True)  # sha256(ticket)
+    user_id = Column(Text, nullable=False)
+    auth_time = Column(BigInteger, nullable=False)
+    token = Column(Text, nullable=False)  # Fernet ciphertext of the session token
+    expires_at = Column(BigInteger, nullable=False, index=True)
+
+
+class AuthHandoffs:
+    CLEANUP_BATCH = 100
+
+    @staticmethod
+    async def create(ticket_hash, *, user_id, auth_time, token_ciphertext, expires_at, now):
+        async with get_async_db_context() as session:
+            expired = await session.execute(
+                select(AuthHandoff.id)
+                .where(AuthHandoff.expires_at <= now)
+                .limit(AuthHandoffs.CLEANUP_BATCH)
+            )
+            expired_ids = list(expired.scalars())
+            if expired_ids:
+                await session.execute(
+                    delete(AuthHandoff).where(AuthHandoff.id.in_(expired_ids))
+                )
+            session.add(
+                AuthHandoff(
+                    id=ticket_hash,
+                    user_id=user_id,
+                    auth_time=auth_time,
+                    token=token_ciphertext,
+                    expires_at=expires_at,
+                )
+            )
+            await session.commit()
+
+    @staticmethod
+    async def consume(ticket_hash, now):
+        """Return (user_id, auth_time, token_ciphertext) once; None if unknown, expired or already used."""
+        async with get_async_db_context() as session:
+            row = await session.execute(
+                select(
+                    AuthHandoff.user_id,
+                    AuthHandoff.auth_time,
+                    AuthHandoff.token,
+                    AuthHandoff.expires_at,
+                ).where(AuthHandoff.id == ticket_hash)
+            )
+            row = row.first()
+            if row is None:
+                return None
+            result = await session.execute(
+                delete(AuthHandoff)
+                .where(AuthHandoff.id == ticket_hash)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                await session.rollback()
+                return None  # A concurrent request consumed it first.
+            await session.commit()
+            if row.expires_at <= now:
+                return None
+            return row.user_id, row.auth_time, row.token

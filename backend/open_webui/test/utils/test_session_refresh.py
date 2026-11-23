@@ -67,7 +67,7 @@ async def env(monkeypatch, tmp_path):
             cursor.close()
 
     async with engines[0].begin() as conn:
-        for table in [User.__table__, Auth.__table__, OAuthSession.__table__, RevokedSession.__table__, SessionLineage.__table__]:
+        for table in [User.__table__, Auth.__table__, OAuthSession.__table__, RevokedSession.__table__, SessionLineage.__table__, security.AuthHandoff.__table__]:
             await conn.run_sync(table.create)
     makers = [async_sessionmaker(engine, expire_on_commit=False) for engine in engines]
     rotation = itertools.cycle(makers)
@@ -615,9 +615,22 @@ async def client(env, monkeypatch):
     monkeypatch.setattr(auths, 'get_permissions', AsyncMock(return_value={}))
     monkeypatch.setattr(auths, 'publish_event', AsyncMock())
     monkeypatch.setattr(socket_main, 'disconnect_user_sessions', AsyncMock())
+    from starlette.middleware.sessions import SessionMiddleware
+
     app = FastAPI()
     app.state.redis = None
     app.include_router(auths.router, prefix='/api/v1/auths')
+
+    @app.get('/test/oauth-callback/{uid}')
+    async def fake_oauth_callback(uid: str, request: Request, response: Response):
+        """What the real callback does for a browser: shared cookie, lineage, one-time hand-over."""
+        token = login_token(uid, auth_method='oauth', now=env.clock.now)
+        response.set_cookie('token', token, httponly=True)
+        await sr.start_session_chain(request, response, token, user=SimpleNamespace(id=uid, role='user'))
+        assert await sr.issue_oauth_handoff(request, response, token)
+        return {'token': token}
+
+    app.add_middleware(SessionMiddleware, secret_key='session-tests-only')
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN) as http:
         yield http
 
@@ -694,13 +707,24 @@ async def test_token_cookie_only_moves_forward(env, client, frozen_jwt):
 async def test_signout_rejects_bad_authorization_without_side_effects(env, client):
     t0, c0 = await open_login()
     forged = t0[:-4] + ('AAAA' if not t0.endswith('AAAA') else 'BBBB')
-    for header, status in [('Bearer', 400), ('Basic Zm9vOmJhcg==', 400), ('Bearer a b', 400), (f'Bearer {forged}', 401)]:
+    for header, status in [
+        ('Bearer', 400),
+        ('Basic Zm9vOmJhcg==', 400),
+        ('Bearer a b', 400),
+        ('Bearer sk-abc', 400),
+        (f'Bearer {forged}', 401),
+    ]:
         response = await client.post(
             '/api/v1/auths/signout',
             headers={'Authorization': header, 'Origin': ORIGIN, 'Cookie': f'{c0}; token={t0}'},
         )
         assert response.status_code == status, header
         assert response.headers.get_list('set-cookie') == []
+    duplicate = await client.post(
+        '/api/v1/auths/signout',
+        headers=[('Authorization', f'Bearer {t0}'), ('Authorization', f'Bearer {t0}'), ('Origin', ORIGIN), ('Cookie', c0)],
+    )
+    assert duplicate.status_code == 400 and duplicate.headers.get_list('set-cookie') == []
     assert (await lineage(t0)).revoked_at is None
     assert await valid(t0)  # the cookie login was not touched in place of the bad header
 
@@ -956,42 +980,109 @@ async def test_late_responses_of_an_earlier_login_never_take_over_the_browser(
     assert not await valid(ta) and not await valid(tb) and not await valid(tb1)
 
 
+async def oauth_callback(client, jar, uid='one'):
+    response = await client.get(f'/test/oauth-callback/{uid}', headers={'Cookie': jar.header()})
+    jar.apply(response.headers.get_list('set-cookie'))
+    return response.json()['token']
+
+
+async def oauth_handoff(client, cookie_header, origin=ORIGIN):
+    return await client.post('/api/v1/auths/oauth/handoff', headers={'Origin': origin, 'Cookie': cookie_header})
+
+
 @pytest.mark.anyio
-async def test_oauth_handoff_is_one_time_http_only_and_supersedes(env, client, frozen_jwt):
+async def test_oauth_handoff_ticket_is_single_use_and_bound_to_the_browser(env, client, frozen_jwt):
     jar = Jar()
     old = await browser_login(jar, now=env.clock.now)
+    old_refresh = set(jar.refresh_cookies())
     env.clock.now += 10
-    fresh = login_token(now=env.clock.now, auth_method='oauth')
-    handoff = f'{sr.HANDOFF_COOKIE}={fresh}'
+    fresh = await oauth_callback(client, jar)
+    ticket = jar.cookies[sr.HANDOFF_COOKIE]
+    assert ticket != fresh and fresh not in jar.header().replace(f'token={fresh}', '')  # only the shared cookie holds it
 
-    # Wrong origin, missing cookie and a forged token never sign in.
-    response = await client.post('/api/v1/auths/oauth/handoff', headers={'Origin': 'https://evil.example', 'Cookie': handoff})
-    assert response.status_code == 403 and sr.HANDOFF_COOKIE in cleared(response.headers.get_list('set-cookie'))
-    assert (await client.post('/api/v1/auths/oauth/handoff', headers={'Origin': ORIGIN})).status_code == 404
-    forged = await client.post(
-        '/api/v1/auths/oauth/handoff', headers={'Origin': ORIGIN, 'Cookie': f'{sr.HANDOFF_COOKIE}={fresh[:-4]}AAAA'}
-    )
-    assert forged.status_code == 401 and sr.HANDOFF_COOKIE in cleared(forged.headers.get_list('set-cookie'))
+    # A refused origin neither signs in nor consumes the pending hand-over.
+    refused = await oauth_handoff(client, jar.header(), origin='https://evil.example')
+    assert refused.status_code == 403 and refused.headers.get_list('set-cookie') == []
+    # The ticket alone, without this browser's server session, is useless and is not consumed either.
+    stolen = await oauth_handoff(client, f'{sr.HANDOFF_COOKIE}={ticket}')
+    assert stolen.status_code == 401
+    assert (await oauth_handoff(client, 'token=x')).status_code == 404
 
-    response = await client.post(
-        '/api/v1/auths/oauth/handoff', headers={'Origin': ORIGIN, 'Cookie': f'{jar.header()}; {handoff}'}
-    )
+    before = jar.header()
+    response = await oauth_handoff(client, before)
     assert response.status_code == 200 and response.headers['cache-control'] == 'no-store'
     body = response.json()
     assert body['token'] == fresh and body['id'] == 'one' and body['expires_at'] == auth_utils.decode_token(fresh)['exp']
     headers = response.headers.get_list('set-cookie')
-    token_header = next(h for h in headers if h.startswith('token='))
-    assert 'httponly' in token_header.lower() and token_header.split(';')[0] == f'token={fresh}'
-    assert sr.HANDOFF_COOKIE in cleared(headers)
-    # The browser's earlier login is ended and its refresh cookie cleared.
-    assert set(jar.refresh_cookies()) <= cleared(headers)
-    assert not await valid(old)
+    jar.apply(headers)
+    assert sr.HANDOFF_COOKIE not in jar.cookies and jar.cookies['token'] == fresh
+    # The browser's earlier login ended and its refresh cookie is gone; the OAuth login's stays.
+    assert not await valid(old) and not (old_refresh & set(jar.refresh_cookies()))
+    assert sid_of(next(iter(jar.refresh_cookies())) + '=x') == auth_utils.decode_token(fresh)['jti']
+    # Replaying the exact pre-hand-over cookies fails: the ticket was consumed.
+    assert (await oauth_handoff(client, before)).status_code == 401
 
-    # Stale hand-overs are refused.
-    late = login_token(now=env.clock.now)
-    env.clock.now += sr.HANDOFF_MAX_AGE + sr.CLOCK_SKEW_SECONDS + 1
-    stale = await client.post('/api/v1/auths/oauth/handoff', headers={'Origin': ORIGIN, 'Cookie': f'{sr.HANDOFF_COOKIE}={late}'})
-    assert stale.status_code == 401
+
+@pytest.mark.anyio
+async def test_stale_oauth_handoff_never_ends_a_newer_login(env, client, frozen_jwt):
+    jar = Jar()
+    await oauth_callback(client, jar)  # sign-in A completes at the IdP, hand-over still pending
+    pending = {k: v for k, v in jar.cookies.items() if not k.startswith(sr.REFRESH_COOKIE_PREFIX)}
+    env.clock.now += 5
+    newer_browser = Jar()
+    newer = await browser_login(newer_browser, now=env.clock.now)  # a later sign-in B in this browser
+    jar.cookies = {**pending, **newer_browser.cookies}
+    response = await oauth_handoff(client, jar.header())
+    assert response.status_code == 409 and 'token' not in response.text
+    assert await valid(newer) and (await lineage(newer)).revoked_at is None
+    # The stale ticket is gone for good.
+    assert (await oauth_handoff(client, jar.header())).status_code == 401
+
+
+@pytest.mark.anyio
+async def test_handoff_ticket_expires(env, client, frozen_jwt):
+    jar = Jar()
+    await oauth_callback(client, jar)
+    env.clock.now += sr.HANDOFF_MAX_AGE + 1
+    assert (await oauth_handoff(client, jar.header())).status_code == 401
+
+
+@pytest.mark.anyio
+async def test_superseding_keeps_the_cookie_when_ending_fails(env, monkeypatch, frozen_jwt):
+    jar = Jar()
+    old = await browser_login(jar, now=env.clock.now)
+    env.clock.now += 5
+    monkeypatch.setattr(sr, 'revoke_lineage', AsyncMock(side_effect=RuntimeError('database busy')))
+    await browser_login(jar, now=env.clock.now)
+    assert sr.refresh_cookie_name(auth_utils.decode_token(old)['jti']) in jar.refresh_cookies()
+
+
+@pytest.mark.anyio
+async def test_renewable_login_uses_its_own_oauth_session(env, monkeypatch):
+    from open_webui.utils import oauth as oauth_utils
+
+    token = login_token(auth_method='oauth')
+    assert await sr.start_session_chain(None, Response(), token, user=SimpleNamespace(id='one', role='user'), oauth_session_id='os-bound')
+    get_token = AsyncMock(return_value=None)
+    request = make_request(token, cookies={'oauth_session_id': 'os-other'})
+    request.scope['app'].state.oauth_manager = SimpleNamespace(get_oauth_token=get_token)
+    request.state.claims, request.state.auth_type = auth_utils.decode_token(token), 'jwt'
+    monkeypatch.setattr(oauth_utils.OAuthSessions, 'get_sessions_by_user_id', AsyncMock(return_value=[SimpleNamespace(id='os-recent', provider='google', updated_at=1)]))
+    assert await oauth_utils.get_system_oauth_token(request, SimpleNamespace(id='one')) is None
+    get_token.assert_awaited_once_with('one', 'os-bound')  # no cookie, no "most recent session" fallback
+
+
+@pytest.mark.anyio
+async def test_legacy_and_new_cookie_names_for_one_login_are_both_settled(env):
+    token = login_token()
+    response = Response()
+    assert await sr.start_session_chain(None, response, token, user=SimpleNamespace(id='one', role='user'))
+    rc = refresh_cookie_of(response)
+    env.clock.now += DAY // 2
+    request = make_request(token, rc, cookies={sr.LEGACY_REFRESH_COOKIE: f'{sid_of(rc)}.{"y" * 43}'})
+    renewed = Response()
+    assert (await sr.refresh_session(request, renewed))['refreshed'] is True
+    assert sr.LEGACY_REFRESH_COOKIE in cleared(set_cookies(renewed))
 
 
 @pytest.mark.anyio

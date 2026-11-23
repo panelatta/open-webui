@@ -225,7 +225,7 @@
 		// deployment is unambiguously SSO-only (single provider, no login form,
 		// no LDAP). Suppressed after logout, by ?form=, ?error=, onboarding,
 		// trusted-header auth, or an existing session/token.
-		if ($config?.oauth?.auto_redirect && !logout && !form && !error) {
+		if ($config?.oauth?.auto_redirect && !logout && !form && !error && !$page.url.searchParams.has('handoff')) {
 			const providers = Object.keys($config?.oauth?.providers ?? {});
 			if (
 				providers.length === 1 &&

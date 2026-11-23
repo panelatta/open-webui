@@ -273,8 +273,8 @@ async def complete_oauth_sign_in(
         user, token, claims = await complete_oauth_handoff(request, response)
     except HTTPException as error:
         failure = JSONResponse({'detail': error.detail}, status_code=error.status_code)
-        if request.cookies.get(HANDOFF_COOKIE):
-            clear_oauth_handoff(failure)
+        if request.cookies.get(HANDOFF_COOKIE) and error.status_code != 403:
+            clear_oauth_handoff(failure)  # A refused origin must not consume someone's pending sign-in.
         return failure
     return {
         'token': token,
@@ -967,8 +967,8 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
     # A sent Authorization header names the login to end; it must be a well-formed, signed Bearer and is
     # checked before anything happens. Only a header-less sign-out falls back to the browser's cookie.
     auth_header = request.headers.get('Authorization')
-    explicit = auth_header is not None
-    token = signout_bearer(auth_header) if explicit else request.cookies.get('token')
+    explicit = bool(request.headers.getlist('authorization'))
+    token = signout_bearer(request) if explicit else request.cookies.get('token')
     # The shared browser cookies only go with the login that is ending (see browser_cookies_belong_to).
     owns_browser_cookies = await browser_cookies_belong_to(request, token, explicit)
 

@@ -137,6 +137,17 @@ async def get_system_oauth_token(request, user):
     """
     oauth_token = None
     try:
+        # A renewable login is bound to the OAuth session it was created with; resolve that one on
+        # the server instead of trusting the shared cookie, and do not fall back to another session.
+        claims = getattr(request.state, 'claims', None) or {}
+        login = claims.get('sid') or claims.get('jti')
+        if login and getattr(request.state, 'auth_type', None) == 'jwt':
+            from open_webui.models.security import SessionChains
+
+            chain = await SessionChains.get(login)
+            if chain and chain.user_id == user.id and chain.oauth_session_id:
+                return await request.app.state.oauth_manager.get_oauth_token(user.id, chain.oauth_session_id)
+
         oauth_session_id = request.cookies.get('oauth_session_id', None)
         if oauth_session_id:
             oauth_token = await request.app.state.oauth_manager.get_oauth_token(
@@ -2312,10 +2323,13 @@ class OAuthManager:
                     secure=WEBUI_AUTH_COOKIE_SECURE,
                     **({'max_age': cookie_max_age} if cookie_max_age is not None else {}),
                 )
-            from open_webui.utils.session_refresh import set_oauth_handoff, start_session_chain
+            from open_webui.utils.session_refresh import issue_oauth_handoff, start_session_chain
 
-            set_oauth_handoff(response, result['token'])
-            response.headers['location'] = f'{redirect_url}?handoff=1'
+            try:
+                if await issue_oauth_handoff(request, response, result['token']):
+                    response.headers['location'] = f'{redirect_url}?handoff=1'
+            except Exception:
+                log.exception('Could not prepare the OAuth sign-in hand-over')
             # A completed browser OAuth login may renew itself; bind the lineage to this OAuth session.
             await start_session_chain(
                 request, response, result['token'], user=user, oauth_session_id=session.id if session else None
