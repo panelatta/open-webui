@@ -636,6 +636,24 @@ async def test_token_cookie_only_moves_forward(env, client, frozen_jwt):
     for cookie in [None, t1, dead, 'garbage']:
         assert await writes_cookie(t1, cookie)
 
+    # Two logins authenticated in the same second are not ordered: neither replaces the other.
+    twin_a, _ = await open_login(now=env.clock.now)
+    twin_b, _ = await open_login(now=env.clock.now)
+    assert not await writes_cookie(twin_a, twin_b) and not await writes_cookie(twin_b, twin_a)
+    # When the cookie's validity cannot be determined, it is left alone.
+    original = auth_utils.is_valid_token
+
+    async def unavailable(decoded, redis=None):
+        if decoded.get('jti') == auth_utils.decode_token(dead)['jti']:
+            raise HTTPException(503, 'Authentication is temporarily unavailable.')
+        return await original(decoded, redis)
+
+    auth_utils.is_valid_token = unavailable
+    try:
+        assert not await writes_cookie(t1, dead)
+    finally:
+        auth_utils.is_valid_token = original
+
     # A renewal of an older login keeps its own refresh cookie but leaves a newer login's token cookie.
     env.clock.now += DAY // 2
     _, response = await refresh(t1, c1, cookies={'token': fresh_same_user})

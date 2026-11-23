@@ -210,8 +210,8 @@ async def get_session_user(
                 detail=ERROR_MESSAGES.INVALID_TOKEN,
             )
 
-        # Never replace a cookie holding another valid login or a newer generation of this one
-        # (see may_write_token_cookie); absent, equal or dead cookies are (re)written.
+        # The shared cookie only moves forward (see may_write_token_cookie): absent, equal or
+        # invalid cookies and older logins/generations are replaced; newer ones are kept.
         if await may_write_token_cookie(request, token):
             max_age = int(expires_at - time.time()) if expires_at else None
             response.set_cookie(
