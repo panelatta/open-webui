@@ -85,6 +85,7 @@ from open_webui.utils.misc import parse_duration, validate_email_format
 from open_webui.utils.rate_limit import RateLimiter
 from open_webui.utils.session_refresh import (
     clear_refresh_cookie,
+    cookie_holds_newer_generation,
     refresh_session,
     revoke_for_signout,
 )
@@ -209,9 +210,9 @@ async def get_session_user(
                 detail=ERROR_MESSAGES.INVALID_TOKEN,
             )
 
-        # Only (re)write the cookie when it is absent or already this token: an identity
-        # lookup must never replace another login's or a newer generation's cookie.
-        if request.cookies.get('token') in (None, token):
+        # Never roll the cookie back to an older generation of the same renewed login; any other
+        # mismatch (e.g. a late response from a previous login) is repaired by writing this token.
+        if not await cookie_holds_newer_generation(request, data):
             max_age = int(expires_at - time.time()) if expires_at else None
             response.set_cookie(
                 key='token',

@@ -118,12 +118,16 @@ def frozen_session_claims(claims) -> dict | None:
     return {**values, 'sid': sid, 'mfa_verified': claims['mfa_verified']}
 
 
+_COOKIE_PART = re.compile(r'[A-Za-z0-9_-]{8,128}')
+
+
 def parse_refresh_cookie(request: Request) -> tuple[str, str] | None:
+    """`<sid>.<secret>` exactly as issued (uuid4 / token_urlsafe characters); anything else is ignored."""
     raw = request.cookies.get(REFRESH_COOKIE)
     if not raw or len(raw) > 256:
         return None
     sid, separator, secret = raw.partition('.')
-    if not separator or not sid or not secret:
+    if not separator or not _COOKIE_PART.fullmatch(sid) or not _COOKIE_PART.fullmatch(secret):
         return None
     return sid, secret
 
@@ -191,13 +195,25 @@ async def start_session_chain(response, token: str, *, user, oauth_session_id=No
     return True
 
 
+LOOPBACK_HOSTS = {'localhost', '127.0.0.1', '::1'}
+
+
+def _origin_of(url) -> tuple[str, str] | None:
+    parts = urlsplit(str(url or ''))
+    if not parts.scheme or not parts.netloc:
+        return None
+    return f'{parts.scheme}://{parts.netloc}', (parts.hostname or '')
+
+
 async def require_first_party_origin(request: Request):
+    """The configured public origin; the request's own origin only when none is configured or it is loopback."""
     allowed = set()
-    for base in (await Config.get('webui.url'), str(request.base_url)):
-        if base:
-            parts = urlsplit(str(base))
-            if parts.scheme and parts.netloc:
-                allowed.add(f'{parts.scheme}://{parts.netloc}')
+    configured = _origin_of(await Config.get('webui.url'))
+    if configured:
+        allowed.add(configured[0])
+    own = _origin_of(request.base_url)
+    if own and (configured is None or own[1] in LOOPBACK_HOSTS):
+        allowed.add(own[0])
     if request.headers.get('origin') not in allowed:
         raise HTTPException(403, 'Invalid request origin.')
     site = request.headers.get('sec-fetch-site')
@@ -393,6 +409,9 @@ async def revoke_for_signout(request: Request, token: str | None) -> bool:
 
     if request.cookies.get(REFRESH_COOKIE) is None:
         return False
+    if token and token_sid is None:
+        # An explicit credential that names no lineage: never fall back to the shared cookie.
+        return False
     cookie = parse_refresh_cookie(request)
     if cookie is None:
         return True
@@ -407,3 +426,27 @@ async def revoke_for_signout(request: Request, token: str | None) -> bool:
     if holds_lineage and chain.revoked_at is None:
         await revoke_lineage(cookie_sid, now, reason='sign-out')
     return True
+
+
+async def cookie_holds_newer_generation(request: Request, data: dict) -> bool:
+    """True when the browser's token cookie is a newer, still valid token of the same lineage as `data`.
+
+    Identity lookups then leave the cookie alone (no rollback to an older generation); in every other
+    case they write the presented token, which also repairs a cookie a late response overwrote."""
+    cookie_token = request.cookies.get('token')
+    if not cookie_token or cookie_token == request_token(request):
+        return False
+    cookie = auth_utils.decode_token(cookie_token)
+    if not isinstance(cookie, dict) or cookie.get('id') != data.get('id'):
+        return False
+    if (cookie.get('sid') or cookie.get('jti')) != (data.get('sid') or data.get('jti')):
+        return False
+    cookie_exp, data_exp = _int(cookie.get('exp')), _int(data.get('exp'))
+    if cookie_exp is None or data_exp is None or cookie_exp <= data_exp:
+        return False
+    return await auth_utils.is_valid_token(cookie, getattr(request.app.state, 'redis', None))
+
+
+def request_token(request: Request) -> str | None:
+    credentials = auth_utils.get_http_authorization_cred(request.headers.get('authorization'))
+    return credentials.credentials if credentials else None

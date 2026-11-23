@@ -14,7 +14,32 @@ export const ACTIVITY_WINDOW_SECONDS = 5 * 60;
 export const NETWORK_RETRY_DELAYS_SECONDS = [5, 15, 30];
 // localStorage key: the jti this browser must never try to renew again (shared by all tabs).
 export const REFRESH_HALT_KEY = 'session-refresh-halt';
+// localStorage key: {jti, deadline} of the renewal in progress. Retries of one token stop at the
+// deadline even across reloads, sleep and tabs, so they always land inside the server's 120 s
+// grace window and an unanswered rotation is never mistaken for a replay.
+export const REFRESH_ATTEMPT_KEY = 'session-refresh-attempt';
+export const REFRESH_RETRY_WINDOW_SECONDS = 90;
 export const REFRESH_LOCK_NAME = 'open-webui-session-refresh';
+
+export type RefreshAttempt = { jti: string; deadline: number };
+
+export const parseRefreshAttempt = (raw: string | null): RefreshAttempt | null => {
+	if (!raw) {
+		return null;
+	}
+	try {
+		const value = JSON.parse(raw);
+		return value && typeof value.jti === 'string' && typeof value.deadline === 'number'
+			? { jti: value.jti, deadline: value.deadline }
+			: null;
+	} catch {
+		return null;
+	}
+};
+
+/** Network failures and 5xx may hide a committed rotation: retry only inside the attempt window. */
+export const isTransientRefreshFailure = (status: number | null): boolean =>
+	status === null || status >= 500;
 
 const decodeBase64Url = (segment: string): string => {
 	const base64 = segment.replace(/-/g, '+').replace(/_/g, '/');

@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
 	decodeJwtClaims,
 	expiryBuffer,
+	isTransientRefreshFailure,
 	networkRetryDelay,
+	parseRefreshAttempt,
 	sameLogin,
 	shouldRefresh
 } from './sessionRefresh';
@@ -71,5 +73,19 @@ describe('session refresh timing', () => {
 
 	it('bounds network retries', () => {
 		expect([0, 1, 2, 3, 4].map(networkRetryDelay)).toEqual([null, 5, 15, 30, null]);
+	});
+});
+
+describe('session refresh attempts', () => {
+	it('parses only well-formed attempt records', () => {
+		expect(parseRefreshAttempt(JSON.stringify({ jti: 'j', deadline: 10 }))).toEqual({ jti: 'j', deadline: 10 });
+		for (const raw of [null, '', '{', '[]', '{"jti":1,"deadline":2}', '{"jti":"j"}']) {
+			expect(parseRefreshAttempt(raw)).toBeNull();
+		}
+	});
+
+	it('treats only network errors and 5xx as possibly committed', () => {
+		expect([null, 500, 502, 503].map(isTransientRefreshFailure)).toEqual([true, true, true, true]);
+		expect([200, 401, 403, 409, 429].map(isTransientRefreshFailure)).toEqual([false, false, false, false, false]);
 	});
 });

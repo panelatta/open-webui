@@ -1,5 +1,8 @@
 """Track first-party session lineages for rotating sliding-session refresh."""
 
+import time
+import uuid
+
 import sqlalchemy as sa
 from alembic import op
 
@@ -37,6 +40,23 @@ def upgrade():
 
 
 def downgrade():
+    # Code before this revision only checks a token's own `jti`, so revoking a lineage by `sid`
+    # would silently stop working. End every login that still has a lineage (revoked ones
+    # included) by rotating the account session stamp before the table disappears.
+    connection = op.get_bind()
+    now = int(time.time())
+    user_ids = [
+        row[0]
+        for row in connection.execute(
+            sa.text("SELECT DISTINCT user_id FROM session_lineage WHERE absolute_expires_at > :now"),
+            {"now": now},
+        )
+    ]
+    for user_id in user_ids:
+        connection.execute(
+            sa.text("UPDATE auth SET session_stamp = :stamp WHERE id = :id"),
+            {"stamp": str(uuid.uuid4()), "id": user_id},
+        )
     op.drop_index("ix_session_lineage_absolute_expires_at", table_name="session_lineage")
     op.drop_index("ix_session_lineage_user_id", table_name="session_lineage")
     op.drop_table("session_lineage")

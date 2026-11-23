@@ -63,9 +63,13 @@
 	import {
 		decodeJwtClaims,
 		expiryBuffer,
+		isTransientRefreshFailure,
 		networkRetryDelay,
+		parseRefreshAttempt,
+		REFRESH_ATTEMPT_KEY,
 		REFRESH_HALT_KEY,
 		REFRESH_LOCK_NAME,
+		REFRESH_RETRY_WINDOW_SECONDS,
 		sameLogin,
 		shouldRefresh
 	} from '$lib/utils/sessionRefresh';
@@ -1055,6 +1059,30 @@
 	let refreshInFlight = false;
 	const refreshBlockedUntil = new Map(); // jti -> server-adjusted seconds
 	const refreshNetworkFailures = new Map(); // jti -> count
+	/** @type {typeof fetch | null} */
+	let baseFetch = null; // window.fetch before the 401 interceptor wraps it
+	let lastExpiryConfirmationAt = 0;
+
+	const readRefreshAttempt = () => {
+		try {
+			return parseRefreshAttempt(localStorage.getItem(REFRESH_ATTEMPT_KEY));
+		} catch {
+			return null;
+		}
+	};
+
+	/** @param {{ jti: string, deadline: number } | null} attempt */
+	const writeRefreshAttempt = (attempt) => {
+		try {
+			if (attempt) {
+				localStorage.setItem(REFRESH_ATTEMPT_KEY, JSON.stringify(attempt));
+			} else {
+				localStorage.removeItem(REFRESH_ATTEMPT_KEY);
+			}
+		} catch {
+			// Storage unavailable: retries are still bounded by the in-memory backoff.
+		}
+	};
 
 	const localNowSeconds = () => Math.floor(Date.now() / 1000);
 	const serverNowSeconds = () => localNowSeconds() + serverClockOffset;
@@ -1110,20 +1138,25 @@
 			return;
 		}
 
-		let result;
+		// Every send for this token happens before one shared deadline (see REFRESH_ATTEMPT_KEY).
+		const attempt = readRefreshAttempt();
+		if (attempt?.jti === claims.jti) {
+			if (localNowSeconds() > attempt.deadline) {
+				haltRefresh(claims.jti);
+				return;
+			}
+		} else {
+			writeRefreshAttempt({
+				jti: claims.jti,
+				deadline: localNowSeconds() + REFRESH_RETRY_WINDOW_SECONDS
+			});
+		}
+
+		let result = null;
 		try {
 			result = await refreshSessionToken(token);
 		} catch (error) {
-			const failures = (refreshNetworkFailures.get(claims.jti) ?? 0) + 1;
-			refreshNetworkFailures.set(claims.jti, failures);
-			const delay = networkRetryDelay(failures);
-			if (delay === null) {
-				haltRefresh(claims.jti);
-			} else {
-				refreshBlockedUntil.set(claims.jti, serverNowSeconds() + delay);
-			}
 			console.warn('Session refresh failed:', error);
-			return;
 		}
 
 		// Results for a token this browser no longer uses are stale: drop them.
@@ -1131,8 +1164,23 @@
 			return;
 		}
 
-		const { status, data, retryAfter } = result;
+		if (isTransientRefreshFailure(result?.status ?? null)) {
+			// The rotation may or may not have committed: retry only inside the attempt window.
+			const failures = (refreshNetworkFailures.get(claims.jti) ?? 0) + 1;
+			refreshNetworkFailures.set(claims.jti, failures);
+			const delay = networkRetryDelay(failures);
+			const deadline = readRefreshAttempt()?.deadline ?? 0;
+			if (delay === null || localNowSeconds() + delay > deadline) {
+				haltRefresh(claims.jti);
+			} else {
+				refreshBlockedUntil.set(claims.jti, serverNowSeconds() + delay);
+			}
+			return;
+		}
+
+		const { status, data, retryAfter } = /** @type {NonNullable<typeof result>} */ (result);
 		if (status === 200 && data?.refreshed === true && typeof data.token === 'string') {
+			writeRefreshAttempt(null);
 			if (typeof data.server_time === 'number') {
 				serverClockOffset = data.server_time - localNowSeconds();
 			}
@@ -1143,6 +1191,8 @@
 			return;
 		}
 		if (status === 429) {
+			// Refused before any rotation (the secret is still current): a later attempt starts afresh.
+			writeRefreshAttempt(null);
 			refreshBlockedUntil.set(claims.jti, serverNowSeconds() + (retryAfter ?? 60));
 			return;
 		}
@@ -1217,8 +1267,40 @@
 			$socket?.emit('session-token', { token: next });
 			return;
 		}
-		// A different user or login: rebuild identity, socket and caches from scratch.
+		// A different user or login: rebuild identity, socket and caches from scratch. Like sign-out,
+		// drop the previous user's per-tab drafts so the next account never sees them.
+		if ((nextClaims?.id ?? null) !== (/** @type {{ id?: string } | null} */ ($user)?.id ?? currentClaims?.id ?? null)) {
+			try {
+				sessionStorage.clear();
+			} catch {
+				// Nothing to clear.
+			}
+		}
 		location.reload();
+	};
+
+	/**
+	 * True only when the server rejects the token; also learns the server clock from `Date`.
+	 * @param {string} token
+	 */
+	const confirmSessionExpired = async (token) => {
+		try {
+			const res = await (baseFetch ?? window.fetch)(`${WEBUI_API_BASE_URL}/auths/`, {
+				method: 'GET',
+				headers: {
+					'Content-Type': 'application/json',
+					Authorization: `Bearer ${token}`
+				},
+				credentials: 'include'
+			});
+			const serverDate = Date.parse(res.headers.get('Date') ?? '');
+			if (Number.isFinite(serverDate)) {
+				serverClockOffset = Math.floor(serverDate / 1000) - localNowSeconds();
+			}
+			return res.status === 401;
+		} catch {
+			return false; // Offline: keep the UI; the server still enforces expiry.
+		}
 	};
 
 	const checkTokenExpiry = async () => {
@@ -1234,7 +1316,19 @@
 		}
 
 		if (now >= exp - (claims ? expiryBuffer(claims) : TOKEN_EXPIRY_BUFFER)) {
-			clearExpiredSession(token);
+			if (!token) {
+				clearExpiredSession(token);
+				return;
+			}
+			// The local clock may be wrong: let the server confirm before ending the session.
+			if (localNowSeconds() - lastExpiryConfirmationAt < 60) {
+				return;
+			}
+			lastExpiryConfirmationAt = localNowSeconds();
+			const expired = await confirmSessionExpired(token);
+			if (expired && localStorage.token === token) {
+				clearExpiredSession(token);
+			}
 			return;
 		}
 
@@ -1356,6 +1450,7 @@
 
 	onMount(async () => {
 		const originalFetch = window.fetch.bind(window);
+		baseFetch = originalFetch;
 		window.fetch = async (input, init) => {
 			const response = await originalFetch(input, init);
 

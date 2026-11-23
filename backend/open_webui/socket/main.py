@@ -517,13 +517,60 @@ async def connect(sid, environ, auth):
             await sio.enter_room(sid, f'user:{user.id}')
 
 
-async def get_bound_user_id(sid: str) -> str | None:
-    """User id an already authenticated connection is bound to, if any."""
+_UNREADABLE = object()
+
+
+async def get_bound_user_id(sid: str):
+    """User id the connection is bound to, None when unbound, or _UNREADABLE when it cannot be read."""
     try:
         session = await sio.get_session(sid)
     except Exception:
-        return None
+        return _UNREADABLE
     return ((session or {}).get('user') or {}).get('id')
+
+
+def _socket_user(user) -> dict:
+    return {
+        **user.model_dump(
+            exclude=[
+                'profile_image_url',
+                'profile_banner_image_url',
+                'date_of_birth',
+                'bio',
+                'gender',
+            ]
+        ),
+        'last_seen_at': int(time.time()),
+    }
+
+
+async def bind_connection(sid: str, user, token: str):
+    """Bind a connection to a verified user so the periodic re-validation covers it."""
+    socket_user = _socket_user(user)
+    SESSION_POOL[sid] = {**socket_user, 'chat_ids': (SESSION_POOL.get(sid) or {}).get('chat_ids', [])}
+    await sio.save_session(sid, {'user': socket_user, 'token': token})
+    LOCAL_AUTHENTICATED_SIDS.add(sid)
+    await sio.enter_room(sid, f'user:{user.id}')
+
+
+async def authorize_room_join(sid: str, user, token: str) -> bool:
+    """Rooms are only joined by a connection bound to this same user (binding it first if unbound)."""
+    bound_user_id = await get_bound_user_id(sid)
+    if bound_user_id is _UNREADABLE or (bound_user_id and bound_user_id != user.id):
+        return False
+    if not bound_user_id:
+        await bind_connection(sid, user, token)
+    return True
+
+
+def _is_older_generation(stored_token: str | None, token: str) -> bool:
+    """True when `token` is an older generation of the same login than the stored token."""
+    stored = decode_token(stored_token or '')
+    candidate = decode_token(token)
+    if not stored or not candidate:
+        return False
+    same_login = (stored.get('sid') or stored.get('jti')) == (candidate.get('sid') or candidate.get('jti'))
+    return same_login and (candidate.get('exp') or 0) < (stored.get('exp') or 0)
 
 
 @sio.on('session-token')
@@ -577,6 +624,8 @@ async def user_join(sid, data):
         return
 
     bound_user_id = await get_bound_user_id(sid)
+    if bound_user_id is _UNREADABLE:
+        return
     if bound_user_id and bound_user_id != user.id:
         # Never switch the principal of an authenticated connection (rooms, chat ids);
         # the client reconnects with its current token instead.
@@ -584,23 +633,15 @@ async def user_join(sid, data):
         await sio.disconnect(sid)
         return
 
-    socket_user = {
-        **user.model_dump(
-            exclude=[
-                'profile_image_url',
-                'profile_banner_image_url',
-                'date_of_birth',
-                'bio',
-                'gender',
-            ]
-        ),
-        'last_seen_at': int(time.time()),
-    }
-
-    SESSION_POOL[sid] = {**socket_user, 'chat_ids': (SESSION_POOL.get(sid) or {}).get('chat_ids', [])}
-    await sio.save_session(sid, {'user': socket_user, 'token': auth['token']})
-    LOCAL_AUTHENTICATED_SIDS.add(sid)
-    await sio.enter_room(sid, f'user:{user.id}')
+    token = auth['token']
+    if bound_user_id:
+        try:
+            stored_token = (await sio.get_session(sid) or {}).get('token')
+        except Exception:
+            return
+        if _is_older_generation(stored_token, token):
+            token = stored_token  # Never roll the re-validated token back to an older generation.
+    await bind_connection(sid, user, token)
 
     # Join all the channels only if user has channels permission
     if user.role == 'admin' or await has_permission(user.id, 'features.channels', await Config.get('user.permissions')):
@@ -662,8 +703,7 @@ async def join_channel(sid, data):
     user = await get_verified_user_by_token(auth['token'], redis)
     if not user:
         return
-    bound_user_id = await get_bound_user_id(sid)
-    if bound_user_id and bound_user_id != user.id:
+    if not await authorize_room_join(sid, user, auth['token']):
         return
 
     # Join all the channels only if user has channels permission
@@ -687,8 +727,7 @@ async def join_note(sid, data):
     user = await get_verified_user_by_token(auth['token'], redis)
     if not user:
         return
-    bound_user_id = await get_bound_user_id(sid)
-    if bound_user_id and bound_user_id != user.id:
+    if not await authorize_room_join(sid, user, auth['token']):
         return
 
     if user.role != 'admin' and not await has_permission(

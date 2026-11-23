@@ -327,8 +327,25 @@ async def test_refresh_requires_strict_bearer_origin_and_cookie(env):
         await sr.refresh_session(request, Response())
     assert await status_of(t0, c0, origin=None) == 403
     assert await status_of(t0, c0, origin='https://evil.example') == 403
+    # With a configured public URL, the request's own (Host-derived) origin is not trusted ...
+    FakeConfig.values['webui.url'] = 'https://public.example'
+    try:
+        assert await status_of(t0, c0) == 403
+        # ... except loopback access, e.g. through an SSH tunnel.
+        local = make_request(t0, c0, origin='http://127.0.0.1:3000')
+        local.scope['scheme'], local.scope['server'] = 'http', ('127.0.0.1', 3000)
+        with pytest.raises(HTTPException) as error:
+            await sr.require_first_party_origin(make_request(t0, c0, origin='https://chat.example'))
+        assert error.value.status_code == 403
+        await sr.require_first_party_origin(local)
+        await sr.require_first_party_origin(make_request(t0, c0, origin='https://public.example'))
+    finally:
+        FakeConfig.values['webui.url'] = ORIGIN
     assert await status_of(t0, c0, extra_headers=[('sec-fetch-site', 'same-site')]) == 403
     assert await status_of(t0, None) == 403  # access token alone never refreshes
+    sid = c0.split('.')[0]
+    for malformed in [f'{sid}.ß√-non-ascii-secret', f'{sid}', f'{sid}.', 'é' * 20 + '.' + 'x' * 20, f'{sid}.{"x" * 200}']:
+        assert await status_of(t0, malformed) == 403, malformed
     assert (await lineage(t0)).generation == 0
     assert await status_of(t0, c0, extra_headers=[('sec-fetch-site', 'same-origin')]) == 200
 
@@ -490,6 +507,14 @@ async def test_revocation_is_only_ever_extended(env):
     await asyncio.gather(*[SessionRevocations.revoke('y', now + n) for n in range(10, 60, 10)])
     async with env.makers[0]() as session:
         assert (await session.get(RevokedSession, digest('y'))).expires_at == now + 50
+    await asyncio.gather(*[SessionRevocations.revoke('z', value) for value in [now + 5, None, now + 500, now + 1]])
+    async with env.makers[1]() as session:
+        assert (await session.get(RevokedSession, digest('z'))).expires_at is None
+    # An expired revocation is replaced, not extended from the past.
+    await SessionRevocations.revoke('w', now - 1)
+    await SessionRevocations.revoke('w', now + 30)
+    async with env.makers[0]() as session:
+        assert (await session.get(RevokedSession, digest('w'))).expires_at == now + 30
 
 
 @pytest.mark.anyio
@@ -521,6 +546,10 @@ async def test_signout_by_cookie_requires_possession_and_spares_other_logins(env
     # Knowing a lineage id is not enough to end it.
     sid_b = cb.split('.')[0]
     assert await sr.revoke_for_signout(make_request(None, f'{sid_b}.guess'), None) is True
+    assert await valid(tb)
+    # An explicit but unusable credential never falls back to the shared cookie.
+    for bogus in ['garbage', 'sk-abc', login_token(typ='automation', id=None)]:
+        assert await sr.revoke_for_signout(make_request(bogus, cb), bogus) is False
     assert await valid(tb)
     # The browser's own refresh cookie ends its lineage when no token is presented.
     assert await sr.revoke_for_signout(make_request(None, cb), None) is True
@@ -562,16 +591,26 @@ async def test_refresh_endpoint_headers(env, client):
 
 
 @pytest.mark.anyio
-async def test_identity_lookup_never_overwrites_another_cookie(env, client):
-    ta, _ = await open_login()
+async def test_identity_lookup_never_rolls_cookie_back_but_repairs_it(env, client):
+    t0, c0 = await open_login()
+    env.clock.now += DAY // 2
+    t1 = (await refresh(t0, c0))[0]['token']
     tb, _ = await open_login('two')
-    other = await client.get('/api/v1/auths/', headers={'Authorization': f'Bearer {ta}', 'Cookie': f'token={tb}'})
-    assert other.status_code == 200 and other.json()['id'] == 'one'
-    assert not any(c.startswith('token=') for c in other.headers.get_list('set-cookie'))
-    same = await client.get('/api/v1/auths/', headers={'Authorization': f'Bearer {ta}', 'Cookie': f'token={ta}'})
-    assert any(c.startswith('token=') for c in same.headers.get_list('set-cookie'))
-    bare = await client.get('/api/v1/auths/', headers={'Authorization': f'Bearer {ta}'})
-    assert any(c.startswith('token=') for c in bare.headers.get_list('set-cookie'))
+
+    def writes_cookie(response):
+        return any(c.startswith('token=') for c in response.headers.get_list('set-cookie'))
+
+    # A late lookup with an older generation leaves the newer cookie of the same login alone.
+    late = await client.get('/api/v1/auths/', headers={'Authorization': f'Bearer {t0}', 'Cookie': f'token={t1}'})
+    assert late.status_code == 200 and not writes_cookie(late)
+    # A cookie left by another login (e.g. overwritten by a late response) is repaired.
+    other = await client.get('/api/v1/auths/', headers={'Authorization': f'Bearer {t1}', 'Cookie': f'token={tb}'})
+    assert other.json()['id'] == 'one' and writes_cookie(other)
+    older = await client.get('/api/v1/auths/', headers={'Authorization': f'Bearer {t1}', 'Cookie': f'token={t0}'})
+    assert writes_cookie(older)
+    for cookie in [f'token={t1}', None]:
+        headers = {'Authorization': f'Bearer {t1}', **({'Cookie': cookie} if cookie else {})}
+        assert writes_cookie(await client.get('/api/v1/auths/', headers=headers))
 
 
 @pytest.mark.anyio
@@ -632,3 +671,53 @@ async def test_socket_join_never_switches_principal(env, monkeypatch):
     await socket_main.join_channel('sid', {'auth': {'token': stranger}})
     await socket_main.join_note('sid', {'auth': {'token': stranger}, 'note_id': 'n'})
     enter.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_socket_room_joins_bind_unbound_connections(env, monkeypatch):
+    from open_webui.socket import main as socket_main
+
+    token, _ = await open_login()
+    sessions = {'sid': {}}
+    monkeypatch.setattr(socket_main.sio, 'get_session', AsyncMock(side_effect=lambda sid: dict(sessions[sid])))
+    monkeypatch.setattr(socket_main.sio, 'save_session', AsyncMock(side_effect=lambda sid, s: sessions.__setitem__(sid, s)))
+    monkeypatch.setattr(socket_main.sio, 'get_environ', lambda sid: {})
+    monkeypatch.setattr(socket_main.sio, 'enter_room', AsyncMock())
+    monkeypatch.setattr(socket_main, 'has_permission', AsyncMock(return_value=False))
+    monkeypatch.setattr(socket_main, 'Config', FakeConfig)
+    await socket_main.join_channel('sid', {'auth': {'token': token}})
+    # The connection is now bound, so the 30 s re-validation covers it.
+    assert sessions['sid']['user']['id'] == 'one' and sessions['sid']['token'] == token
+    assert 'sid' in socket_main.LOCAL_AUTHENTICATED_SIDS
+    socket_main.LOCAL_AUTHENTICATED_SIDS.discard('sid')
+    socket_main.SESSION_POOL.pop('sid', None)
+
+    monkeypatch.setattr(socket_main.sio, 'get_session', AsyncMock(side_effect=RuntimeError('gone')))
+    enter = AsyncMock()
+    monkeypatch.setattr(socket_main.sio, 'enter_room', enter)
+    await socket_main.join_channel('sid', {'auth': {'token': token}})
+    await socket_main.user_join('sid', {'auth': {'token': token}})
+    enter.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_socket_user_join_never_rolls_token_back(env, monkeypatch):
+    from open_webui.socket import main as socket_main
+
+    t0, c0 = await open_login()
+    env.clock.now += DAY // 2
+    t1 = (await refresh(t0, c0))[0]['token']
+    sessions = {'sid': {'user': {'id': 'one'}, 'token': t1}}
+    monkeypatch.setattr(socket_main.sio, 'get_session', AsyncMock(side_effect=lambda sid: dict(sessions[sid])))
+    monkeypatch.setattr(socket_main.sio, 'save_session', AsyncMock(side_effect=lambda sid, s: sessions.__setitem__(sid, s)))
+    monkeypatch.setattr(socket_main.sio, 'get_environ', lambda sid: {})
+    monkeypatch.setattr(socket_main.sio, 'enter_room', AsyncMock())
+    monkeypatch.setattr(socket_main, 'has_permission', AsyncMock(return_value=False))
+    monkeypatch.setattr(socket_main, 'Config', FakeConfig)
+    await socket_main.user_join('sid', {'auth': {'token': t0}})
+    assert sessions['sid']['token'] == t1
+    other_login, _ = await open_login()
+    await socket_main.user_join('sid', {'auth': {'token': other_login}})
+    assert sessions['sid']['token'] == other_login  # a newer login of the same user may take over
+    socket_main.LOCAL_AUTHENTICATED_SIDS.discard('sid')
+    socket_main.SESSION_POOL.pop('sid', None)

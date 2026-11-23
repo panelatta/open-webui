@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    case,
     Column,
     Integer,
     String,
@@ -36,6 +37,11 @@ class SessionRevocations:
     async def revoke(jti, expires_at=None, db=None):
         """Revoke an identifier; an existing revocation is only ever extended (None = permanent)."""
         key = digest(jti)
+        async with get_async_db_context(db) as session:
+            dialect = session.get_bind().dialect.name
+        if dialect in {"sqlite", "postgresql"}:
+            await SessionRevocations._upsert(key, expires_at, dialect, db)
+            return
         for _ in range(3):
             async with get_async_db_context(db) as session:
                 try:
@@ -62,6 +68,41 @@ class SessionRevocations:
                     # A concurrent sign-out inserted the row first; retry as an extension.
                     await session.rollback()
         raise RuntimeError("Session revocation could not be persisted.")
+
+    @staticmethod
+    async def _upsert(key, expires_at, dialect, db=None):
+        """One atomic statement: insert, or keep the longer expiry (NULL = permanent wins)."""
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert
+
+        statement = insert(RevokedSession).values(id=key, expires_at=expires_at)
+        incoming = statement.excluded.expires_at
+        statement = statement.on_conflict_do_update(
+            index_elements=[RevokedSession.id],
+            set_={
+                "expires_at": case(
+                    (
+                        or_(
+                            RevokedSession.expires_at.is_(None),
+                            incoming.is_(None),
+                        ),
+                        None,
+                    ),
+                    (incoming > RevokedSession.expires_at, incoming),
+                    else_=RevokedSession.expires_at,
+                )
+            },
+        )
+        async with get_async_db_context(db) as session:
+            await session.execute(
+                delete(RevokedSession).where(
+                    RevokedSession.expires_at <= int(time.time())
+                )
+            )
+            await session.execute(statement)
+            await session.commit()
 
     @staticmethod
     async def is_revoked(jti, db=None):
@@ -257,14 +298,13 @@ class SessionChains:
             return SessionLineageModel.model_validate(row) if row else None
 
     @staticmethod
-    async def active_user_ids(now) -> list[str]:
+    async def unexpired_user_ids(now) -> list[str]:
+        """Users with any lineage not past its absolute expiry, revoked ones included: code that
+        predates lineages only checks `jti`, so all of them must be ended before a rollback."""
         async with get_async_db_context() as session:
             rows = await session.execute(
                 select(SessionLineage.user_id)
-                .where(
-                    SessionLineage.revoked_at.is_(None),
-                    SessionLineage.absolute_expires_at > now,
-                )
+                .where(SessionLineage.absolute_expires_at > now)
                 .distinct()
             )
             return list(rows.scalars())
