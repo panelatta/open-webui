@@ -623,11 +623,10 @@ async def client(env, monkeypatch):
 
     @app.get('/test/oauth-callback/{uid}')
     async def fake_oauth_callback(uid: str, request: Request, response: Response):
-        """What the real callback does for a browser: shared cookie, lineage, one-time hand-over."""
+        """What the real callback does for a browser: one-time hand-over, then its lineage."""
         token = login_token(uid, auth_method='oauth', now=env.clock.now)
-        response.set_cookie('token', token, httponly=True)
-        await sr.start_session_chain(request, response, token, user=SimpleNamespace(id=uid, role='user'))
         assert await sr.issue_oauth_handoff(request, response, token)
+        await sr.start_session_chain(request, response, token, user=SimpleNamespace(id=uid, role='user'))
         return {'token': token}
 
     app.add_middleware(SessionMiddleware, secret_key='session-tests-only')
@@ -998,7 +997,8 @@ async def test_oauth_handoff_ticket_is_single_use_and_bound_to_the_browser(env, 
     env.clock.now += 10
     fresh = await oauth_callback(client, jar)
     ticket = jar.cookies[sr.HANDOFF_COOKIE]
-    assert ticket != fresh and fresh not in jar.header().replace(f'token={fresh}', '')  # only the shared cookie holds it
+    # The browser holds only the ticket; the shared cookie still belongs to the earlier login.
+    assert ticket != fresh and fresh not in jar.header() and jar.cookies['token'] != fresh
 
     # A refused origin neither signs in nor consumes the pending hand-over.
     refused = await oauth_handoff(client, jar.header(), origin='https://evil.example')
@@ -1032,11 +1032,15 @@ async def test_stale_oauth_handoff_never_ends_a_newer_login(env, client, frozen_
     newer_browser = Jar()
     newer = await browser_login(newer_browser, now=env.clock.now)  # a later sign-in B in this browser
     jar.cookies = {**pending, **newer_browser.cookies}
-    response = await oauth_handoff(client, jar.header())
+    before = jar.header()
+    response = await oauth_handoff(client, before)
     assert response.status_code == 409 and 'token' not in response.text
+    assert not any(h.startswith('token=') for h in response.headers.get_list('set-cookie'))
+    jar.apply(response.headers.get_list('set-cookie'))
+    assert jar.cookies['token'] == newer  # the browser keeps using the newer login
     assert await valid(newer) and (await lineage(newer)).revoked_at is None
-    # The stale ticket is gone for good.
-    assert (await oauth_handoff(client, jar.header())).status_code == 401
+    # The stale ticket is gone for good, even if the browser sends it again.
+    assert (await oauth_handoff(client, before)).status_code == 401
 
 
 @pytest.mark.anyio

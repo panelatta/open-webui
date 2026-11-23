@@ -2296,15 +2296,8 @@ class OAuthManager:
                 response.headers['location'] = f'{redirect_url}?mfa=1'
         else:
             # The token reaches the auth page through a one-time HttpOnly hand-over (see
-            # utils/session_refresh.py), not by making the shared session cookie readable to JS.
-            response.set_cookie(
-                'token',
-                result['token'],
-                httponly=True,
-                samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
-                secure=WEBUI_AUTH_COOKIE_SECURE,
-                **({'max_age': cookie_max_age} if cookie_max_age is not None else {}),
-            )
+            # utils/session_refresh.py). The shared `token` cookie is only written once that hand-over
+            # succeeds, so a refused or abandoned sign-in never changes the browser's current login.
             if session:
                 response.set_cookie(
                     'oauth_session_id',
@@ -2326,14 +2319,19 @@ class OAuthManager:
             from open_webui.utils.session_refresh import issue_oauth_handoff, start_session_chain
 
             try:
-                if await issue_oauth_handoff(request, response, result['token']):
-                    response.headers['location'] = f'{redirect_url}?handoff=1'
+                handed_over = await issue_oauth_handoff(request, response, result['token'])
             except Exception:
                 log.exception('Could not prepare the OAuth sign-in hand-over')
-            # A completed browser OAuth login may renew itself; bind the lineage to this OAuth session.
-            await start_session_chain(
-                request, response, result['token'], user=user, oauth_session_id=session.id if session else None
-            )
+                handed_over = False
+            if handed_over:
+                response.headers['location'] = f'{redirect_url}?handoff=1'
+                # A completed browser OAuth login may renew itself; bind the lineage to this OAuth session.
+                await start_session_chain(
+                    request, response, result['token'], user=user, oauth_session_id=session.id if session else None
+                )
+            else:
+                message = urllib.parse.quote_plus('Sign-in could not be completed. Please try again.')
+                response.headers['location'] = f'{redirect_url}?error={message}'
 
         return response
 
