@@ -2284,10 +2284,12 @@ class OAuthManager:
                 )
                 response.headers['location'] = f'{redirect_url}?mfa=1'
         else:
+            # The token reaches the auth page through a one-time HttpOnly hand-over (see
+            # utils/session_refresh.py), not by making the shared session cookie readable to JS.
             response.set_cookie(
                 'token',
                 result['token'],
-                httponly=False,
+                httponly=True,
                 samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
                 secure=WEBUI_AUTH_COOKIE_SECURE,
                 **({'max_age': cookie_max_age} if cookie_max_age is not None else {}),
@@ -2310,11 +2312,13 @@ class OAuthManager:
                     secure=WEBUI_AUTH_COOKIE_SECURE,
                     **({'max_age': cookie_max_age} if cookie_max_age is not None else {}),
                 )
-            # A completed browser OAuth login may renew itself; bind the lineage to this OAuth session.
-            from open_webui.utils.session_refresh import start_session_chain
+            from open_webui.utils.session_refresh import set_oauth_handoff, start_session_chain
 
+            set_oauth_handoff(response, result['token'])
+            response.headers['location'] = f'{redirect_url}?handoff=1'
+            # A completed browser OAuth login may renew itself; bind the lineage to this OAuth session.
             await start_session_chain(
-                response, result['token'], user=user, oauth_session_id=session.id if session else None
+                request, response, result['token'], user=user, oauth_session_id=session.id if session else None
             )
 
         return response

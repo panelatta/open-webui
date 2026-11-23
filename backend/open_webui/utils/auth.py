@@ -402,12 +402,14 @@ async def get_current_user(
     # not held for the entire request duration (e.g., during 30+ second LLM calls).
 ):
     token = None
+    token_from_cookie = False
 
     if auth_token is not None:
         token = auth_token.credentials
 
     if token is None and 'token' in request.cookies:
         token = request.cookies.get('token')
+        token_from_cookie = True
 
     # Fallback to request.state.token (set by middleware, e.g. for x-api-key)
     if token is None and hasattr(request.state, 'token') and request.state.token:
@@ -494,16 +496,18 @@ async def get_current_user(
                 detail=ERROR_MESSAGES.UNAUTHORIZED,
             )
     except Exception as e:
-        # Delete the token cookie
-        if request.cookies.get('token'):
-            response.delete_cookie('token')
+        # Only a failing cookie credential clears the cookies. A bad Bearer (e.g. a late request of an
+        # earlier login) says nothing about the browser's current cookie login and must not end it.
+        if token_from_cookie:
+            if request.cookies.get('token'):
+                response.delete_cookie('token')
 
-        if request.cookies.get('oauth_id_token'):
-            response.delete_cookie('oauth_id_token')
+            if request.cookies.get('oauth_id_token'):
+                response.delete_cookie('oauth_id_token')
 
-        # Delete OAuth session if present
-        if request.cookies.get('oauth_session_id'):
-            response.delete_cookie('oauth_session_id')
+            # Delete OAuth session if present
+            if request.cookies.get('oauth_session_id'):
+                response.delete_cookie('oauth_session_id')
 
         raise e
 
@@ -756,7 +760,7 @@ async def create_session_response(
         if renewable:
             from open_webui.utils.session_refresh import start_session_chain
 
-            await start_session_chain(response, token, user=user, oauth_session_id=oauth_session_id)
+            await start_session_chain(request, response, token, user=user, oauth_session_id=oauth_session_id)
     await publish_event(
         request,
         EVENTS.AUTH_LOGIN,

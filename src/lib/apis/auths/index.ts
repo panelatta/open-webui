@@ -380,6 +380,28 @@ export const userSignUp = async (
 };
 
 /**
+ * Finish a browser OAuth sign-in by consuming the one-time HttpOnly hand-over cookie set by the
+ * callback. Resolves to the session user (with token), or null when no sign-in is pending.
+ */
+export const completeOAuthSignIn = async () => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/oauth/handoff`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json'
+		},
+		credentials: 'include'
+	});
+	if (res.status === 404) {
+		return null;
+	}
+	const data = await res.json().catch(() => null);
+	if (!res.ok) {
+		throw data?.detail ?? 'Sign-in could not be completed. Please try again.';
+	}
+	return data;
+};
+
+/**
  * Renew a first-party session. The HttpOnly refresh cookie travels with `credentials: 'include'`;
  * the Bearer header names the access token being renewed. Never throws on HTTP errors.
  */

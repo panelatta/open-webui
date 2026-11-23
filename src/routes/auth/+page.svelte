@@ -18,7 +18,8 @@
 		getSessionUser,
 		userSignIn,
 		userSignUp,
-		updateUserTimezone
+		updateUserTimezone,
+		completeOAuthSignIn
 	} from '$lib/apis/auths';
 
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
@@ -137,6 +138,20 @@
 		}
 	};
 
+	// A completed OAuth callback redirects here with ?handoff=1 and a one-time HttpOnly cookie.
+	const oauthHandoffHandler = async () => {
+		const sessionUser = await completeOAuthSignIn().catch((error) => {
+			toast.error(`${error}`);
+			return null;
+		});
+		if (!sessionUser?.token) {
+			return false;
+		}
+		localStorage.token = sessionUser.token;
+		await setSessionUser(sessionUser, localStorage.getItem('redirectPath') || null);
+		return true;
+	};
+
 	const oauthCallbackHandler = async () => {
 		// Get the value of the 'token' cookie
 		function getCookie(name) {
@@ -169,6 +184,11 @@
 	onMount(async () => {
 		const redirectPath = $page.url.searchParams.get('redirect');
 		const logout = $page.url.searchParams.get('state') === 'logout';
+
+		// Finish a just-completed OAuth sign-in first, even if an older login is still active here.
+		if ($page.url.searchParams.has('handoff') && (await oauthHandoffHandler())) {
+			return;
+		}
 
 		if ($user && !logout) {
 			goto(redirectPath || '/');

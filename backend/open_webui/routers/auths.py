@@ -84,10 +84,15 @@ from open_webui.utils.mfa import MFA_CONFIG_KEYS, MfaConfigForm, get_mfa_config,
 from open_webui.utils.misc import parse_duration, validate_email_format
 from open_webui.utils.rate_limit import RateLimiter
 from open_webui.utils.session_refresh import (
+    HANDOFF_COOKIE,
+    browser_cookies_belong_to,
+    clear_oauth_handoff,
     clear_refresh_cookie,
+    complete_oauth_handoff,
     may_write_token_cookie,
     refresh_session,
     revoke_for_signout,
+    signout_bearer,
 )
 from pydantic import BaseModel, StrictStr, field_validator
 from sqlalchemy.exc import IntegrityError
@@ -257,6 +262,37 @@ async def refresh_session_token(request: Request, response: Response):
     """Renew a first-party browser session: needs the Bearer access token *and* the rotating
     HttpOnly refresh cookie issued at interactive login. See utils/session_refresh.py."""
     return await refresh_session(request, response)
+
+
+@router.post('/oauth/handoff')
+async def complete_oauth_sign_in(
+    request: Request, response: Response, db: AsyncSession = Depends(get_async_session)
+):
+    """Finish a browser OAuth sign-in by consuming the one-time hand-over cookie set by the callback."""
+    try:
+        user, token, claims = await complete_oauth_handoff(request, response)
+    except HTTPException as error:
+        failure = JSONResponse({'detail': error.detail}, status_code=error.status_code)
+        if request.cookies.get(HANDOFF_COOKIE):
+            clear_oauth_handoff(failure)
+        return failure
+    return {
+        'token': token,
+        'token_type': 'Bearer',
+        'expires_at': claims.get('exp'),
+        'id': user.id,
+        'email': user.email,
+        'name': user.name,
+        'role': user.role,
+        'profile_image_url': user.profile_image_url,
+        'bio': user.bio,
+        'gender': user.gender,
+        'date_of_birth': user.date_of_birth,
+        'status_emoji': user.status_emoji,
+        'status_message': user.status_message,
+        'status_expires_at': user.status_expires_at,
+        'permissions': await get_permissions(user.id, await Config.get('user.permissions'), db=db),
+    }
 
 
 ############################
@@ -928,18 +964,15 @@ async def signup(
 
 @router.post('/signout')
 async def signout(request: Request, response: Response, db: AsyncSession = Depends(get_async_session)):
-    # get auth token from headers or cookies
-    token = None
+    # A sent Authorization header names the login to end; it must be a well-formed, signed Bearer and is
+    # checked before anything happens. Only a header-less sign-out falls back to the browser's cookie.
     auth_header = request.headers.get('Authorization')
-    if auth_header:
-        auth_cred = get_http_authorization_cred(auth_header)
-        if auth_cred is not None:
-            token = auth_cred.credentials
-    if token is None and auth_header is None:
-        # A sent Authorization header is authoritative; only header-less sign-outs use the cookie.
-        token = request.cookies.get('token')
+    explicit = auth_header is not None
+    token = signout_bearer(auth_header) if explicit else request.cookies.get('token')
+    # The shared browser cookies only go with the login that is ending (see browser_cookies_belong_to).
+    owns_browser_cookies = await browser_cookies_belong_to(request, token, explicit)
 
-    oauth_session_id = request.cookies.get('oauth_session_id')
+    oauth_session_id = request.cookies.get('oauth_session_id') if owns_browser_cookies else None
     session = await OAuthSessions.get_session_by_id(oauth_session_id, db=db) if oauth_session_id else None
 
     if token:
@@ -957,22 +990,19 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
             **({'source': 'oauth', 'data': {'auth_method': 'oauth', 'provider': session.provider}} if session else {}),
         )
 
-    # End the whole renewable lineage, even when the presented token has already expired. A sent
-    # Authorization header is authoritative: if it is unusable, the cookies are not used instead.
-    explicit = auth_header is not None
-    header_cred = get_http_authorization_cred(auth_header) if explicit else None
-    lineage_token = (header_cred.credentials if header_cred else None) if explicit else request.cookies.get('token')
-    if await revoke_for_signout(request, lineage_token, explicit=explicit):
-        clear_refresh_cookie(response)
+    # End the whole renewable lineage, even when the presented token has already expired.
+    for name in await revoke_for_signout(request, token, explicit=explicit):
+        clear_refresh_cookie(response, name)
 
-    response.delete_cookie('token')
-    try:
-        request.session.clear()
-    except Exception:
-        pass
-    response.delete_cookie('owui-session')
-    response.delete_cookie('oui-session')
-    response.delete_cookie('oauth_id_token')
+    if owns_browser_cookies:
+        response.delete_cookie('token')
+        try:
+            request.session.clear()
+        except Exception:
+            pass
+        response.delete_cookie('owui-session')
+        response.delete_cookie('oui-session')
+        response.delete_cookie('oauth_id_token')
 
     if oauth_session_id:
         response.delete_cookie('oauth_session_id')
