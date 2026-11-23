@@ -68,6 +68,7 @@ from open_webui.utils.auth import (
     create_signin_response,
     create_token,
     decode_token,
+    decode_token_for_revocation,
     get_admin_user,
     get_current_user,
     get_http_authorization_cred,
@@ -974,6 +975,9 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
 
     oauth_session_id = request.cookies.get('oauth_session_id') if owns_browser_cookies else None
     session = await OAuthSessions.get_session_by_id(oauth_session_id, db=db) if oauth_session_id else None
+    signing_out = decode_token_for_revocation(token) if token else None
+    if session and isinstance(signing_out, dict) and session.user_id != signing_out.get('id'):
+        session = None  # Never end (or redirect to) another user's IdP session.
 
     if token:
         actor = None

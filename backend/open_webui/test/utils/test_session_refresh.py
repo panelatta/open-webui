@@ -625,7 +625,7 @@ async def client(env, monkeypatch):
     async def fake_oauth_callback(uid: str, request: Request, response: Response):
         """What the real callback does for a browser: one-time hand-over, then its lineage."""
         token = login_token(uid, auth_method='oauth', now=env.clock.now)
-        assert await sr.issue_oauth_handoff(request, response, token)
+        assert await sr.issue_oauth_handoff(request, response, token, oauth_session_id='os-1', id_token='idt-1')
         await sr.start_session_chain(request, response, token, user=SimpleNamespace(id=uid, role='user'))
         return {'token': token}
 
@@ -997,8 +997,9 @@ async def test_oauth_handoff_ticket_is_single_use_and_bound_to_the_browser(env, 
     env.clock.now += 10
     fresh = await oauth_callback(client, jar)
     ticket = jar.cookies[sr.HANDOFF_COOKIE]
-    # The browser holds only the ticket; the shared cookie still belongs to the earlier login.
+    # The browser holds only the ticket; the shared cookies still belong to the earlier login.
     assert ticket != fresh and fresh not in jar.header() and jar.cookies['token'] != fresh
+    assert 'oauth_session_id' not in jar.cookies and 'oauth_id_token' not in jar.cookies
 
     # A refused origin neither signs in nor consumes the pending hand-over.
     refused = await oauth_handoff(client, jar.header(), origin='https://evil.example')
@@ -1016,6 +1017,8 @@ async def test_oauth_handoff_ticket_is_single_use_and_bound_to_the_browser(env, 
     headers = response.headers.get_list('set-cookie')
     jar.apply(headers)
     assert sr.HANDOFF_COOKIE not in jar.cookies and jar.cookies['token'] == fresh
+    assert jar.cookies['oauth_session_id'] == 'os-1' and jar.cookies['oauth_id_token'] == 'idt-1'
+    assert all('httponly' in h.lower() for h in headers if h.split('=', 1)[0] in {'oauth_session_id', 'oauth_id_token'})
     # The browser's earlier login ended and its refresh cookie is gone; the OAuth login's stays.
     assert not await valid(old) and not (old_refresh & set(jar.refresh_cookies()))
     assert sid_of(next(iter(jar.refresh_cookies())) + '=x') == auth_utils.decode_token(fresh)['jti']
@@ -1128,3 +1131,18 @@ async def test_signout_only_clears_shared_cookies_of_the_login_it_ends(env, clie
     response = await client.post('/api/v1/auths/signout', headers={'Origin': ORIGIN, 'Cookie': f'{cb}; token={tb}'})
     assert {cb.split('=', 1)[0], 'token'} <= cleared(response.headers.get_list('set-cookie'))
     assert not await valid(tb)
+
+
+@pytest.mark.anyio
+async def test_dead_account_cookie_is_anonymous_for_public_endpoints(env, monkeypatch):
+    token = login_token('two')
+    decoded = auth_utils.decode_token(token)
+    assert await auth_utils.is_valid_token_or_anonymous(decoded)
+    async with env.makers[0]() as session:
+        await session.execute(update(Auth).where(Auth.id == 'two').values(active=False))
+        await session.commit()
+    assert await auth_utils.is_valid_token_or_anonymous(decoded) is False  # disabled: no login, no error
+    monkeypatch.setattr(mfa_utils, 'get_auth', AsyncMock(side_effect=HTTPException(503, 'unavailable')))
+    with pytest.raises(HTTPException) as error:
+        await auth_utils.is_valid_token_or_anonymous(decoded)
+    assert error.value.status_code == 503  # an outage is still an error

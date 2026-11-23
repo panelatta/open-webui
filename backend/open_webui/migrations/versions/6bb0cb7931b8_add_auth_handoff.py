@@ -16,6 +16,8 @@ def upgrade():
         sa.Column("user_id", sa.Text(), nullable=False),
         sa.Column("auth_time", sa.BigInteger(), nullable=False),
         sa.Column("token", sa.Text(), nullable=False),
+        sa.Column("oauth_session_id", sa.Text(), nullable=True),
+        sa.Column("id_token", sa.Text(), nullable=True),
         sa.Column("expires_at", sa.BigInteger(), nullable=False),
     )
     op.create_index("ix_auth_handoff_expires_at", "auth_handoff", ["expires_at"])

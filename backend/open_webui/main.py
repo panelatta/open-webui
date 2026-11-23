@@ -232,6 +232,7 @@ from open_webui.utils.auth import (
     get_license_data,
     get_verified_user,
     is_valid_token,
+    is_valid_token_or_anonymous,
 )
 from open_webui.utils.chat import (
     chat_completed as chat_completed_handler,
@@ -2404,7 +2405,9 @@ async def get_app_config(request: Request):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail='Invalid token',
             )
-        if data is not None and 'id' in data and await is_valid_token(data, request.app.state.redis):
+        # A leftover cookie of a deleted or disabled account must not block the public config (and with
+        # it the sign-in page): such a visitor is simply anonymous.
+        if data is not None and 'id' in data and await is_valid_token_or_anonymous(data, request.app.state.redis):
             user = await Users.get_user_by_id(data['id'])
 
     group_defaults = None

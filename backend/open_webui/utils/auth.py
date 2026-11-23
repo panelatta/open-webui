@@ -342,6 +342,18 @@ async def is_valid_token(decoded, redis=None) -> bool:
     return True
 
 
+async def is_valid_token_or_anonymous(decoded, redis=None) -> bool:
+    """is_valid_token for endpoints that also serve anonymous visitors: a token of a deleted or
+    disabled account counts as no login (False) instead of failing the request; other errors
+    (e.g. 503 while the database is unavailable) still propagate."""
+    try:
+        return await is_valid_token(decoded, redis)
+    except HTTPException as error:
+        if error.status_code == status.HTTP_401_UNAUTHORIZED:
+            return False
+        raise
+
+
 async def invalidate_token(request, token):
     decoded = decode_token(token)
 

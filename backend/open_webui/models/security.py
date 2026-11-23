@@ -401,6 +401,8 @@ class AuthHandoff(Base):
     user_id = Column(Text, nullable=False)
     auth_time = Column(BigInteger, nullable=False)
     token = Column(Text, nullable=False)  # Fernet ciphertext of the session token
+    oauth_session_id = Column(Text, nullable=True)
+    id_token = Column(Text, nullable=True)  # Fernet ciphertext of the IdP id_token, if kept as a cookie
     expires_at = Column(BigInteger, nullable=False, index=True)
 
 
@@ -408,7 +410,17 @@ class AuthHandoffs:
     CLEANUP_BATCH = 100
 
     @staticmethod
-    async def create(ticket_hash, *, user_id, auth_time, token_ciphertext, expires_at, now):
+    async def create(
+        ticket_hash,
+        *,
+        user_id,
+        auth_time,
+        token_ciphertext,
+        expires_at,
+        now,
+        oauth_session_id=None,
+        id_token_ciphertext=None,
+    ):
         async with get_async_db_context() as session:
             expired = await session.execute(
                 select(AuthHandoff.id)
@@ -426,6 +438,8 @@ class AuthHandoffs:
                     user_id=user_id,
                     auth_time=auth_time,
                     token=token_ciphertext,
+                    oauth_session_id=oauth_session_id,
+                    id_token=id_token_ciphertext,
                     expires_at=expires_at,
                 )
             )
@@ -433,13 +447,15 @@ class AuthHandoffs:
 
     @staticmethod
     async def consume(ticket_hash, now):
-        """Return (user_id, auth_time, token_ciphertext) once; None if unknown, expired or already used."""
+        """Return the pending hand-over once; None if unknown, expired or already used."""
         async with get_async_db_context() as session:
             row = await session.execute(
                 select(
                     AuthHandoff.user_id,
                     AuthHandoff.auth_time,
                     AuthHandoff.token,
+                    AuthHandoff.oauth_session_id,
+                    AuthHandoff.id_token,
                     AuthHandoff.expires_at,
                 ).where(AuthHandoff.id == ticket_hash)
             )
@@ -457,4 +473,4 @@ class AuthHandoffs:
             await session.commit()
             if row.expires_at <= now:
                 return None
-            return row.user_id, row.auth_time, row.token
+            return row

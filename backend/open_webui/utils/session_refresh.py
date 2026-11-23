@@ -21,6 +21,7 @@ from fastapi import HTTPException, Request, Response
 from open_webui.config import ENABLE_SESSION_REFRESH, SESSION_MAX_LIFETIME
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import (
+    ENABLE_OAUTH_ID_TOKEN_COOKIE,
     WEBUI_AUTH_COOKIE_SAME_SITE,
     WEBUI_AUTH_COOKIE_SECURE,
     WEBUI_AUTH_TRUSTED_EMAIL_HEADER,
@@ -598,8 +599,11 @@ async def browser_cookies_belong_to(request: Request, token: str | None, explici
         return False
 
 
-async def issue_oauth_handoff(request: Request, response: Response, token: str) -> bool:
-    """Park a just-issued OAuth session token for one-time pick-up by the auth page of this browser."""
+async def issue_oauth_handoff(
+    request: Request, response: Response, token: str, *, oauth_session_id=None, id_token=None
+) -> bool:
+    """Park a just-issued OAuth session token (and the login's OAuth session cookies) for one-time
+    pick-up by the auth page of this browser. Nothing of the new login is written to shared cookies yet."""
     from open_webui.utils.mfa import cipher
 
     claims = auth_utils.decode_token(token)
@@ -614,6 +618,8 @@ async def issue_oauth_handoff(request: Request, response: Response, token: str) 
         token_ciphertext=cipher().encrypt(token.encode()).decode(),
         expires_at=now + HANDOFF_MAX_AGE,
         now=now,
+        oauth_session_id=oauth_session_id,
+        id_token_ciphertext=cipher().encrypt(id_token.encode()).decode() if id_token else None,
     )
     request.session[HANDOFF_SESSION_KEY] = digest(ticket)
     _set_handoff_cookie(response, ticket)
@@ -643,9 +649,10 @@ async def complete_oauth_handoff(request: Request, response: Response):
     pending = await AuthHandoffs.consume(digest(ticket), now)
     if pending is None:
         raise HTTPException(401, 'Sign-in expired or already used. Please sign in again.')
-    user_id, auth_time, ciphertext = pending
+    user_id, auth_time = pending.user_id, pending.auth_time
     try:
-        token = cipher().decrypt(ciphertext.encode()).decode()
+        token = cipher().decrypt(pending.token.encode()).decode()
+        id_token = cipher().decrypt(pending.id_token.encode()).decode() if pending.id_token else None
     except Exception:
         raise HTTPException(401, ERROR_MESSAGES.INVALID_TOKEN) from None
     decoded = auth_utils.decode_token(token)
@@ -664,6 +671,7 @@ async def complete_oauth_handoff(request: Request, response: Response):
         # A later sign-in already completed in this browser: this hand-over is stale.
         raise HTTPException(409, 'A newer sign-in is already active in this browser.')
     await supersede_browser_lineages(request, response, keep_sid=keep_sid, auth_time=auth_time)
+    max_age = max(0, (_int(decoded.get('exp')) or 0) - now)
     if await may_write_token_cookie(request, token):
         response.set_cookie(
             'token',
@@ -671,8 +679,19 @@ async def complete_oauth_handoff(request: Request, response: Response):
             httponly=True,
             secure=WEBUI_AUTH_COOKIE_SECURE,
             samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
-            max_age=max(0, (_int(decoded.get('exp')) or 0) - now),
+            max_age=max_age,
         )
+    # The login's OAuth session cookies only arrive together with the login itself.
+    for name, value in (('oauth_session_id', pending.oauth_session_id), ('oauth_id_token', id_token)):
+        if value:
+            response.set_cookie(
+                name,
+                value,
+                httponly=True,
+                secure=WEBUI_AUTH_COOKIE_SECURE,
+                samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+                max_age=max_age,
+            )
     return user, token, decoded
 
 
