@@ -85,7 +85,7 @@ from open_webui.utils.misc import parse_duration, validate_email_format
 from open_webui.utils.rate_limit import RateLimiter
 from open_webui.utils.session_refresh import (
     clear_refresh_cookie,
-    cookie_holds_newer_generation,
+    may_write_token_cookie,
     refresh_session,
     revoke_for_signout,
 )
@@ -210,9 +210,9 @@ async def get_session_user(
                 detail=ERROR_MESSAGES.INVALID_TOKEN,
             )
 
-        # Never roll the cookie back to an older generation of the same renewed login; any other
-        # mismatch (e.g. a late response from a previous login) is repaired by writing this token.
-        if not await cookie_holds_newer_generation(request, data):
+        # Never replace a cookie holding another valid login or a newer generation of this one
+        # (see may_write_token_cookie); absent, equal or dead cookies are (re)written.
+        if await may_write_token_cookie(request, token):
             max_age = int(expires_at - time.time()) if expires_at else None
             response.set_cookie(
                 key='token',
@@ -956,8 +956,12 @@ async def signout(request: Request, response: Response, db: AsyncSession = Depen
             **({'source': 'oauth', 'data': {'auth_method': 'oauth', 'provider': session.provider}} if session else {}),
         )
 
-    # End the whole renewable lineage, even when the presented token has already expired.
-    if await revoke_for_signout(request, token):
+    # End the whole renewable lineage, even when the presented token has already expired. A sent
+    # Authorization header is authoritative: if it is unusable, the cookies are not used instead.
+    explicit = auth_header is not None
+    header_cred = get_http_authorization_cred(auth_header) if explicit else None
+    lineage_token = (header_cred.credentials if header_cred else None) if explicit else request.cookies.get('token')
+    if await revoke_for_signout(request, lineage_token, explicit=explicit):
         clear_refresh_cookie(response)
 
     response.delete_cookie('token')

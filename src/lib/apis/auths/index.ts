@@ -402,7 +402,8 @@ export const refreshSessionToken = async (token: string) => {
 };
 
 // Sign-out names the token it ends, so the server revokes that login's whole renewable lineage
-// (even after expiry) instead of whatever the shared cookie currently holds.
+// (even after expiry) instead of whatever the shared cookie currently holds. Throws when the server
+// did not confirm, including network failures, so callers never report an unconfirmed sign-out.
 export const userSignOut = async (token: string | null = localStorage.token ?? null) => {
 	let error = null;
 
@@ -420,7 +421,7 @@ export const userSignOut = async (token: string | null = localStorage.token ?? n
 		})
 		.catch((err) => {
 			console.error(err);
-			error = err.detail;
+			error = err?.detail ?? 'Sign out could not be confirmed. Please check your connection and try again.';
 			return null;
 		});
 

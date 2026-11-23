@@ -545,11 +545,11 @@ async def test_signout_by_cookie_requires_possession_and_spares_other_logins(env
     assert not await valid(ta) and await valid(tb)
     # Knowing a lineage id is not enough to end it.
     sid_b = cb.split('.')[0]
-    assert await sr.revoke_for_signout(make_request(None, f'{sid_b}.guess'), None) is True
+    assert await sr.revoke_for_signout(make_request(None, f'{sid_b}.{"x" * 43}'), None) is True
     assert await valid(tb)
     # An explicit but unusable credential never falls back to the shared cookie.
-    for bogus in ['garbage', 'sk-abc', login_token(typ='automation', id=None)]:
-        assert await sr.revoke_for_signout(make_request(bogus, cb), bogus) is False
+    for bogus in ['garbage', 'sk-abc', login_token(typ='automation', id=None), None]:
+        assert await sr.revoke_for_signout(make_request(bogus, cb), bogus, explicit=True) is False
     assert await valid(tb)
     # The browser's own refresh cookie ends its lineage when no token is presented.
     assert await sr.revoke_for_signout(make_request(None, cb), None) is True
@@ -591,26 +591,43 @@ async def test_refresh_endpoint_headers(env, client):
 
 
 @pytest.mark.anyio
-async def test_identity_lookup_never_rolls_cookie_back_but_repairs_it(env, client):
+async def test_identity_lookup_only_replaces_absent_equal_or_dead_cookies(env, client):
     t0, c0 = await open_login()
     env.clock.now += DAY // 2
     t1 = (await refresh(t0, c0))[0]['token']
-    tb, _ = await open_login('two')
+    fresh_other_user, _ = await open_login('two')
+    fresh_same_user, _ = await open_login()
+    dead, _ = await open_login()
+    await sr.revoke_for_signout(make_request(dead, None), dead, explicit=True)
 
-    def writes_cookie(response):
+    async def writes_cookie(bearer, cookie):
+        headers = {'Authorization': f'Bearer {bearer}', **({'Cookie': f'token={cookie}'} if cookie else {})}
+        response = await client.get('/api/v1/auths/', headers=headers)
+        assert response.status_code == 200
         return any(c.startswith('token=') for c in response.headers.get_list('set-cookie'))
 
-    # A late lookup with an older generation leaves the newer cookie of the same login alone.
-    late = await client.get('/api/v1/auths/', headers={'Authorization': f'Bearer {t0}', 'Cookie': f'token={t1}'})
-    assert late.status_code == 200 and not writes_cookie(late)
-    # A cookie left by another login (e.g. overwritten by a late response) is repaired.
-    other = await client.get('/api/v1/auths/', headers={'Authorization': f'Bearer {t1}', 'Cookie': f'token={tb}'})
-    assert other.json()['id'] == 'one' and writes_cookie(other)
-    older = await client.get('/api/v1/auths/', headers={'Authorization': f'Bearer {t1}', 'Cookie': f'token={t0}'})
-    assert writes_cookie(older)
-    for cookie in [f'token={t1}', None]:
-        headers = {'Authorization': f'Bearer {t1}', **({'Cookie': cookie} if cookie else {})}
-        assert writes_cookie(await client.get('/api/v1/auths/', headers=headers))
+    # Never roll a newer generation back, never replace a fresh login (OAuth hand-over cookie).
+    assert not await writes_cookie(t0, t1)
+    assert not await writes_cookie(t1, fresh_other_user)
+    assert not await writes_cookie(t1, fresh_same_user)
+    # Absent, equal, revoked or garbage cookies are (re)written.
+    assert await writes_cookie(t1, None)
+    assert await writes_cookie(t1, t1)
+    assert await writes_cookie(t1, dead)
+    assert await writes_cookie(t1, 'garbage')
+
+
+@pytest.mark.anyio
+async def test_signout_with_malformed_authorization_spares_cookie_lineage(env, client):
+    t0, c0 = await open_login()
+    for header in ['Bearer', 'Basic Zm9vOmJhcg==', 'Bearer a b']:
+        response = await client.post(
+            '/api/v1/auths/signout',
+            headers={'Authorization': header, 'Origin': ORIGIN, 'Cookie': f'{sr.REFRESH_COOKIE}={c0}; token={t0}'},
+        )
+        assert response.status_code == 200
+        assert not any(c.startswith(f'{sr.REFRESH_COOKIE}=') for c in response.headers.get_list('set-cookie'))
+    assert (await lineage(t0)).revoked_at is None
 
 
 @pytest.mark.anyio
@@ -714,10 +731,55 @@ async def test_socket_user_join_never_rolls_token_back(env, monkeypatch):
     monkeypatch.setattr(socket_main.sio, 'enter_room', AsyncMock())
     monkeypatch.setattr(socket_main, 'has_permission', AsyncMock(return_value=False))
     monkeypatch.setattr(socket_main, 'Config', FakeConfig)
+    disconnect = AsyncMock()
+    monkeypatch.setattr(socket_main.sio, 'disconnect', disconnect)
     await socket_main.user_join('sid', {'auth': {'token': t0}})
-    assert sessions['sid']['token'] == t1
+    assert sessions['sid']['token'] == t1  # never rolled back to an older generation
+    disconnect.assert_not_awaited()
     other_login, _ = await open_login()
     await socket_main.user_join('sid', {'auth': {'token': other_login}})
-    assert sessions['sid']['token'] == other_login  # a newer login of the same user may take over
+    assert sessions['sid']['token'] == t1  # another live login must reconnect instead
+    disconnect.assert_awaited_once_with('sid')
     socket_main.LOCAL_AUTHENTICATED_SIDS.discard('sid')
     socket_main.SESSION_POOL.pop('sid', None)
+
+
+@pytest.mark.anyio
+async def test_one_clock_drives_issue_rotation_and_jwt_expiry(env, monkeypatch):
+    """Issue, renew and expire on the same (fake) clock as PyJWT's own exp/iat checks."""
+    import datetime as dt
+    import jwt as pyjwt
+
+    class FrozenDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return dt.datetime.fromtimestamp(env.clock.now, tz or dt.timezone.utc)
+
+    def decode(token):
+        try:
+            claims = pyjwt.decode(token, auth_utils.SESSION_SECRET, algorithms=[auth_utils.ALGORITHM],
+                                  options={'verify_exp': False, 'verify_iat': False})
+        except Exception:
+            return None
+        return claims if claims.get('exp', 0) > env.clock.now else None  # PyJWT: valid while now < exp
+
+    monkeypatch.setattr(auth_utils, 'datetime', FrozenDatetime)
+    monkeypatch.setattr(auth_utils, 'decode_token', decode)
+    FakeConfig.values['auth.jwt_expiry'] = '5m'
+    t0, c0 = await open_login(now=env.clock.now, lifetime=300)
+    assert auth_utils.decode_token(t0)['iat'] == env.clock.now
+
+    env.clock.now += 149
+    assert await status_of(t0, c0) == 429
+    env.clock.now += 1
+    result, response = await refresh(t0, c0)
+    t1, c1 = result['token'], cookie_value(response, sr.REFRESH_COOKIE)
+    claims = auth_utils.decode_token(t1)
+    assert claims['iat'] == env.clock.now and claims['exp'] == env.clock.now + 300
+
+    env.clock.now = claims['exp'] - 1
+    assert await valid(t1)
+    env.clock.now = claims['exp']
+    assert auth_utils.decode_token(t1) is None
+    assert await status_of(t1, c1) == 401  # idle past the access lifetime: sign in again
+    assert auth_utils.decode_token(t0) is None

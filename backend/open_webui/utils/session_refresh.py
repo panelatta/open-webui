@@ -393,9 +393,12 @@ async def refresh_session(request: Request, response: Response) -> dict:
     }
 
 
-async def revoke_for_signout(request: Request, token: str | None) -> bool:
+async def revoke_for_signout(request: Request, token: str | None, *, explicit: bool = False) -> bool:
     """Revoke the lineage named by a signed (possibly expired) session token, and the browser's
-    refresh cookie lineage when it belongs to the same login. Returns whether to clear that cookie."""
+    refresh cookie lineage when it belongs to the same login. Returns whether to clear that cookie.
+
+    `explicit` means the caller sent an Authorization header: if that names no lineage (missing,
+    malformed, unsigned, API key, non-session), the shared refresh cookie is never used instead."""
     now = int(time.time())
     token_sid = None
     if token and not token.startswith('sk-'):
@@ -409,7 +412,7 @@ async def revoke_for_signout(request: Request, token: str | None) -> bool:
 
     if request.cookies.get(REFRESH_COOKIE) is None:
         return False
-    if token and token_sid is None:
+    if explicit and token_sid is None:
         # An explicit credential that names no lineage: never fall back to the shared cookie.
         return False
     cookie = parse_refresh_cookie(request)
@@ -428,25 +431,17 @@ async def revoke_for_signout(request: Request, token: str | None) -> bool:
     return True
 
 
-async def cookie_holds_newer_generation(request: Request, data: dict) -> bool:
-    """True when the browser's token cookie is a newer, still valid token of the same lineage as `data`.
-
-    Identity lookups then leave the cookie alone (no rollback to an older generation); in every other
-    case they write the presented token, which also repairs a cookie a late response overwrote."""
+async def may_write_token_cookie(request: Request, token: str) -> bool:
+    """Identity lookups only (re)write the token cookie when it is absent, already `token`, or no longer
+    valid. A cookie holding another valid login (e.g. a fresh OAuth hand-over the auth page still has to
+    read) or a newer generation of this one is never replaced; a revoked or expired one is repaired."""
     cookie_token = request.cookies.get('token')
-    if not cookie_token or cookie_token == request_token(request):
-        return False
+    if not cookie_token or cookie_token == token:
+        return True
     cookie = auth_utils.decode_token(cookie_token)
-    if not isinstance(cookie, dict) or cookie.get('id') != data.get('id'):
-        return False
-    if (cookie.get('sid') or cookie.get('jti')) != (data.get('sid') or data.get('jti')):
-        return False
-    cookie_exp, data_exp = _int(cookie.get('exp')), _int(data.get('exp'))
-    if cookie_exp is None or data_exp is None or cookie_exp <= data_exp:
-        return False
-    return await auth_utils.is_valid_token(cookie, getattr(request.app.state, 'redis', None))
-
-
-def request_token(request: Request) -> str | None:
-    credentials = auth_utils.get_http_authorization_cred(request.headers.get('authorization'))
-    return credentials.credentials if credentials else None
+    if not isinstance(cookie, dict) or not _str(cookie.get('id')):
+        return True
+    try:
+        return not await auth_utils.is_valid_token(cookie, getattr(request.app.state, 'redis', None))
+    except HTTPException:
+        return True  # The cookie's account is gone or disabled.

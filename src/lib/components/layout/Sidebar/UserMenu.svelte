@@ -583,7 +583,14 @@
 				class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
 				type="button"
 				on:click={async () => {
-					const res = await userSignOut();
+					let res;
+					try {
+						res = await userSignOut();
+					} catch (error) {
+						// Keep the session visible: the server has not confirmed it ended.
+						toast.error(`${error}`);
+						return;
+					}
 					localStorage.removeItem('token');
 
 					location.href = getLogoutRedirectUrl(res?.redirect_url);

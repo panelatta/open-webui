@@ -1191,9 +1191,21 @@
 			return;
 		}
 		if (status === 429) {
-			// Refused before any rotation (the secret is still current): a later attempt starts afresh.
-			writeRefreshAttempt(null);
-			refreshBlockedUntil.set(claims.jti, serverNowSeconds() + (retryAfter ?? 60));
+			const wait = retryAfter ?? 60;
+			if (data?.detail === 'session_refresh_too_soon') {
+				// The server checked the refresh secret and found it current: nothing was rotated.
+				writeRefreshAttempt(null);
+				refreshBlockedUntil.set(claims.jti, serverNowSeconds() + wait);
+				return;
+			}
+			// Throttled before the secret was checked (e.g. the shared sign-in limiter): an earlier
+			// unanswered attempt may still have rotated, so stay inside the original attempt window.
+			const deadline = readRefreshAttempt()?.deadline ?? 0;
+			if (localNowSeconds() + wait > deadline) {
+				haltRefresh(claims.jti);
+			} else {
+				refreshBlockedUntil.set(claims.jti, serverNowSeconds() + wait);
+			}
 			return;
 		}
 		// 401: the global 401 handler re-checks the access token and signs out only if it is

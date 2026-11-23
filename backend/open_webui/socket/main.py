@@ -563,14 +563,8 @@ async def authorize_room_join(sid: str, user, token: str) -> bool:
     return True
 
 
-def _is_older_generation(stored_token: str | None, token: str) -> bool:
-    """True when `token` is an older generation of the same login than the stored token."""
-    stored = decode_token(stored_token or '')
-    candidate = decode_token(token)
-    if not stored or not candidate:
-        return False
-    same_login = (stored.get('sid') or stored.get('jti')) == (candidate.get('sid') or candidate.get('jti'))
-    return same_login and (candidate.get('exp') or 0) < (stored.get('exp') or 0)
+def _login_of(claims: dict) -> str | None:
+    return claims.get('sid') or claims.get('jti')
 
 
 @sio.on('session-token')
@@ -636,11 +630,17 @@ async def user_join(sid, data):
     token = auth['token']
     if bound_user_id:
         try:
-            stored_token = (await sio.get_session(sid) or {}).get('token')
+            stored = decode_token((await sio.get_session(sid) or {}).get('token') or '')
         except Exception:
             return
-        if _is_older_generation(stored_token, token):
-            token = stored_token  # Never roll the re-validated token back to an older generation.
+        candidate = decode_token(token) or {}
+        if stored and _login_of(stored) != _login_of(candidate):
+            # Another live login of the same user must not take over this connection's rooms.
+            log.info('Socket %s joined with a different login; disconnecting it.', sid)
+            await sio.disconnect(sid)
+            return
+        if stored and (candidate.get('exp') or 0) < (stored.get('exp') or 0):
+            token = (await sio.get_session(sid) or {}).get('token')  # Never roll back a generation.
     await bind_connection(sid, user, token)
 
     # Join all the channels only if user has channels permission
